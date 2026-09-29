@@ -892,8 +892,8 @@ bool ggml_metal_ptq1_multicol_enabled(const ggml_tensor * op) {
 bool ggml_metal_pq2_0_multicol_enabled(const ggml_tensor * op) {
     static const bool disabled = getenv("GGML_METAL_PQ2_0_MULTICOL_DISABLE") && atoi(getenv("GGML_METAL_PQ2_0_MULTICOL_DISABLE")) == 1;
     return !disabled && op->src[0]->type == GGML_TYPE_PQ2_0 && op->src[1]->type == GGML_TYPE_F32 &&
-           op->src[0]->ne[0] % ggml_blck_size(GGML_TYPE_PQ2_0) == 0 && op->src[1]->nb[0] == sizeof(float) &&
-           op->src[1]->ne[1] >= 2 && op->src[1]->ne[1] <= 8;
+           op->src[0]->ne[0] % (4 * ggml_blck_size(GGML_TYPE_PQ2_0)) == 0 && op->src[1]->nb[0] == sizeof(float) &&
+           op->src[1]->ne[1] >= 2 && op->src[1]->ne[1] <= 4;
 }
 
 
@@ -964,7 +964,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 nr0 = N_R0_PQ2_0;
                 if (ggml_metal_pq2_0_multicol_enabled(op)) {
                     nr0 = 4;
-                    nsg = 1;
+                    nsg = 4;
                     nr1 = ne11;
                     snprintf(pq2_suffix, sizeof(pq2_suffix), "_mc_c%d", nr1);
                     suffix = pq2_suffix;

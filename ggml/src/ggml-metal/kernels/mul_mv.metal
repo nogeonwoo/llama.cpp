@@ -1347,37 +1347,62 @@ kernel void kernel_mul_mv_pq2_0_multicol(
         ax[row] = (device const block_pq2_0 *) ((device char *) src0 + offset0);
     }
 
-    float yl[nr1][16];
+    threadgroup float4 sh_x[nr1][128];
+
     float sumf[nr0][nr1] = {};
 
     const short ix = (tiisg/8);
     const short il = (tiisg%8)*16;
+    const ushort tid = sgitg * 32 + tiisg;
+    const ushort swizzle_write_idx = (tid & 3) * 32 + (tid >> 2);
 
-    device const float * yb = y + ix*QK_PQ2_0 + il;
-
-    for (int ib = ix; ib < nb; ib += N_SIMDWIDTH/8) {
-        float sumy[nr1] = {};
+    for (int ib_chunk = 0; ib_chunk < nb; ib_chunk += 4) {
         FOR_UNROLL (short col = 0; col < nr1; ++col) {
-            device const float * yc = (device const float *) ((device const char *) yb + col*args.nb11);
+            device const float4 * y_col4 = (device const float4 *) ((device const char *) y + col*args.nb11);
+            sh_x[col][swizzle_write_idx] = y_col4[ib_chunk * 32 + tid];
+        }
 
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float4 xc[nr1][4];
+        float sumx[nr1] = {};
+
+        FOR_UNROLL (short col = 0; col < nr1; ++col) {
             FOR_UNROLL (short j = 0; j < 4; j++) {
-                const float y0 = yc[4*j + 0];
-                const float y1 = yc[4*j + 1];
-                const float y2 = yc[4*j + 2];
-                const float y3 = yc[4*j + 3];
-                sumy[col] += (y0 + y1) + (y2 + y3);
-                yl[col][4*j + 0] = y3 - 4.0f*y2;
-                yl[col][4*j + 1] = y2 - 4.0f*y1;
-                yl[col][4*j + 2] = y1 - 4.0f*y0;
-                yl[col][4*j + 3] = y0;
+                xc[col][j] = sh_x[col][j * 32 + tiisg];
+                sumx[col] += (xc[col][j].x + xc[col][j].y) + (xc[col][j].z + xc[col][j].w);
             }
         }
 
         FOR_UNROLL (short row = 0; row < nr0; row++) {
-            pq2_0_dot_multicol<nr1>(ax[row] + ib, yl, sumy, il, sumf[row]);
+            device const block_pq2_0 * qb = ax[row] + (ib_chunk + ix);
+            device const uint8_t * qs = qb->qs + (il / 4);
+            const float d4 = (float)qb->d * 4.0f;
+
+            float acc[nr1] = {};
+
+            FOR_UNROLL (short j = 0; j < 4; j++) {
+                const uint b = qs[j];
+                const uint c0 = (b >> 0) & 3;
+                const uint c1 = (b >> 2) & 3;
+                const uint c2 = (b >> 4) & 3;
+                const uint c3 = (b >> 6) & 3;
+                const float4 v = as_type<float4>(uint4(0x3F800000) | (uint4(c0, c1, c2, c3) << 21));
+
+                FOR_UNROLL (short col = 0; col < nr1; ++col) {
+                    acc[col] = fma(v.x, xc[col][j].x, acc[col]);
+                    acc[col] = fma(v.y, xc[col][j].y, acc[col]);
+                    acc[col] = fma(v.z, xc[col][j].z, acc[col]);
+                    acc[col] = fma(v.w, xc[col][j].w, acc[col]);
+                }
+            }
+
+            FOR_UNROLL (short col = 0; col < nr1; ++col) {
+                sumf[row][col] = fma(d4, (acc[col] - 1.25f * sumx[col]), sumf[row][col]);
+            }
         }
 
-        yb += QK_PQ2_0 * (N_SIMDWIDTH/8);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
