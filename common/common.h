@@ -389,7 +389,8 @@ struct common_params_speculative {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE || t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        // allow +1 rollback window for Masked-4 batch padding without exceeding recurrent state buffer
+        return needs_rs_seq ? (draft.n_max + 1) : 0u;
     }
 };
 

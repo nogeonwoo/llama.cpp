@@ -14,11 +14,13 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "speculative-tap.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 #include <cinttypes>
 #include <exception>
 #include <iterator>
@@ -786,6 +788,151 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
 // server_context_impl (private implementation)
 //
 
+// Path B0 glue (asynchronous DFlash feature ingest) for llama-server.
+//
+// Owns the spec::layer_tap and decides, per decode batch, whether the tap may be armed. The tap follows exactly one
+// sequence (seq_id 0) and only on pure generation batches; every other batch takes the unchanged sequential path.
+//
+// Threading contract:
+//   - eligible()           update_slots() thread (reads slot/batch state, no other thread writes it at that point)
+//   - arm()/disarm()       the thread that executes llama_decode(ctx_tgt): layer_tap only intercepts its owner thread
+//   - collect()/abort()    update_slots() thread; they join the DFlash worker, so ctx_dft is exclusively ours afterwards
+// Invariant: the worker is only busy between arm() and the collect()/abort() of the same update_slots() iteration.
+struct server_tap_pipe {
+    ::spec::layer_tap tap;
+
+    common_speculative * handle = nullptr;
+
+    bool         cb_installed = false; // params.cb_eval points at `tap` (must happen before the target context exists)
+    bool         attached     = false; // common_speculative_pipeline_attach() accepted the tap
+    bool         pending      = false; // arm() ran for the batch in flight, collect() has not run yet
+    int32_t      max_rows     = 0;     // n_draft_max + 1
+    llama_seq_id seq_id       = 0;     // the only sequence the tap follows
+
+    static bool env_enabled() {
+        const char * e = std::getenv("LLAMA_SPEC_PIPELINE");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }
+
+    // call before the target context is created: cb_eval is read once, at context creation
+    void install_cb(common_params & params) {
+        cb_installed = false;
+
+        if (!env_enabled()) {
+            return;
+        }
+        if (params.cb_eval != nullptr && params.cb_eval != ::spec::layer_tap::eval_cb) {
+            return; // somebody else owns the eval callback
+        }
+
+        params.cb_eval           = ::spec::layer_tap::eval_cb;
+        params.cb_eval_user_data = &tap;
+        cb_installed             = true;
+    }
+
+    // the drafter context must not see the tap callback
+    static void strip_cb(common_params & params) {
+        if (params.cb_eval == ::spec::layer_tap::eval_cb) {
+            params.cb_eval           = nullptr;
+            params.cb_eval_user_data = nullptr;
+        }
+    }
+
+    bool attach(common_speculative * s, int32_t n_draft_max) {
+        attached = false;
+        pending  = false;
+        handle   = nullptr;
+
+        if (!cb_installed || s == nullptr) {
+            return false;
+        }
+        if (!common_speculative_pipeline_attach(s, &tap)) {
+            return false;
+        }
+
+        handle   = s;
+        max_rows = std::max<int32_t>(1, n_draft_max + 1);
+        tap.reserve_rows(max_rows);
+        attached = true;
+        return true;
+    }
+
+    // must run while `handle` is still alive
+    void detach() {
+        if (attached) {
+            const ::spec::pipe_stats st = common_speculative_pipeline_get_stats(handle);
+            SRV_INF("tap pipeline: ingest_jobs = %" PRIu64 ", verify_fail = %" PRIu64 ", tap_fail = %" PRIu64
+                    ", t_worker = %.2f ms, t_wait = %.2f ms, t_window = %.2f ms, disabled = %d\n",
+                    st.ingest_jobs, st.verify_fail, st.tap_fail,
+                    st.t_worker_us / 1000.0, st.t_wait_us / 1000.0, st.t_window_us / 1000.0, (int) st.disabled);
+            common_speculative_pipeline_abort(handle);
+        }
+        attached = false;
+        pending  = false;
+        handle   = nullptr;
+    }
+
+    // true when this batch is a pure generation step of the followed sequence: all rows are the anchor plus the
+    // drafts of that slot, the batch is not split, and no embedding input is involved
+    bool eligible(const server_batch & b, int32_t off, const llama_batch & view, const std::vector<server_slot> & slots) const {
+        if (!attached || pending || b.has_embd || off != 0 || view.n_tokens != b.size()) {
+            return false;
+        }
+        if (view.n_tokens < 1 || view.n_tokens > max_rows || (size_t) seq_id >= slots.size()) {
+            return false;
+        }
+
+        const server_slot & sl = slots[seq_id];
+        if (sl.state != SLOT_STATE_GENERATING || !sl.can_speculate() || sl.spec_is_replay) {
+            return false;
+        }
+        if ((size_t) view.n_tokens != sl.spec_draft.size() + 1) {
+            return false;
+        }
+
+        const llama_pos pos0 = b.tokens[0].pos;
+        for (int32_t i = 0; i < view.n_tokens; ++i) {
+            const auto & t = b.tokens[i];
+            if (t.id_slot != seq_id || t.is_prompt || !t.output || t.pos != pos0 + i) {
+                return false;
+            }
+        }
+
+        return !common_speculative_pipeline_get_stats(handle).disabled;
+    }
+
+    // decode thread, immediately before llama_decode(ctx_tgt, view)
+    void arm(const llama_batch & view) {
+        pending = true;
+        // the return value only says whether a lookahead hypothesis was declared; collect()/abort() are
+        // no-ops when nothing was submitted, so the caller does not need it
+        (void) common_speculative_pipeline_arm(handle, seq_id, view.pos[0], view.n_tokens, view.n_tokens - 1);
+    }
+
+    // decode thread, right after llama_decode()/llama_synchronize() returned (also on failure)
+    void disarm() {
+        common_speculative_pipeline_disarm(handle, ggml_time_us());
+    }
+
+    // update_slots() thread: after the token(s) of `seq` were sampled, before any other use of ctx_dft
+    void collect(llama_seq_id seq, int n_accepted, llama_token id_last) {
+        if (!pending || seq != seq_id) {
+            return;
+        }
+        pending = false;
+        common_speculative_pipeline_collect(handle, seq, n_accepted, id_last);
+    }
+
+    // error paths and checkpoint restores: join the worker and drop whatever is in flight
+    void abort() {
+        if (!attached) {
+            return;
+        }
+        pending = false;
+        common_speculative_pipeline_abort(handle);
+    }
+};
+
 struct server_context_impl {
     friend struct server_context;
 
@@ -831,6 +978,9 @@ private:
     // use server_context methods instead
 
     common_params params_base;
+
+    // note: declared before llama_init / spec, so it outlives the contexts that hold a pointer to its tap
+    server_tap_pipe tap_pipe;
 
     // note: keep these alive - they determine the lifetime of the model, context, etc.
     common_init_result_ptr llama_init;
@@ -890,6 +1040,8 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        tap_pipe.detach();
+
         spec.reset();
         spec_init.reset();
 
@@ -1050,6 +1202,10 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
+        if (has_spec) {
+            tap_pipe.install_cb(params_base);
+        }
+
         llama_init = common_init_from_params(params_base);
 
         model_tgt = llama_init->model();
@@ -1078,6 +1234,7 @@ private:
 
             {
                 common_params params_dft = common_base_params_to_speculative(params_base);
+                server_tap_pipe::strip_cb(params_dft);
 
                 // progress callback
                 params_dft.load_progress_callback           = load_progress_callback;
@@ -1215,6 +1372,12 @@ private:
             if (!spec_types_skipped.empty()) {
                 SRV_WRN("speculative types requested but not initialized (e.g. no draft model): %s\n",
                         common_speculative_type_name_str(spec_types_skipped).c_str());
+            }
+
+            if (tap_pipe.attach(spec.get(), common_speculative_n_max(&params_base.speculative))) {
+                SRV_INF("%s", "speculative tap pipeline (async feature ingest) attached\n");
+            } else if (tap_pipe.cb_installed) {
+                SRV_WRN("%s", "LLAMA_SPEC_PIPELINE is set but the tap pipeline could not be attached, using the sequential path\n");
             }
         } else {
             if (!spec_types_requested.empty()) {
@@ -2666,6 +2829,8 @@ private:
     }
 
     void abort_all_slots(const std::string & reason) {
+        tap_pipe.abort();
+
         for (auto & slot : slots) {
             if (slot.is_processing()) {
                 send_error(slot, reason, ERROR_TYPE_SERVER);
@@ -3592,14 +3757,24 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        const bool tap_ok = has_output && tap_pipe.eligible(batch, off, batch_view, slots);
         queue_tasks.yield_to_queue([&]() {
+            // arm on the thread that runs llama_decode(): the tap only intercepts its owner thread
+            if (tap_ok) {
+                tap_pipe.arm(batch_view);
+            }
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
+            if (tap_ok) {
+                tap_pipe.disarm();
+            }
         });
 
         if (ret != 0) {
+            tap_pipe.abort();
+
             {
                 std::string err;
 
@@ -3774,6 +3949,9 @@ private:
 
             common_sampler_accept(slot.smpl.get(), id, true);
 
+            // plain step: one token produced, nothing to accept or roll back; join the ingest worker before ctx_dft is used again
+            tap_pipe.collect(slot.id, 0, id);
+
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
             const int64_t t_now = ggml_time_us();
 
@@ -3830,6 +4008,9 @@ private:
 
                 GGML_ASSERT(accepted.size() >= 1);
 
+                // join the ingest worker and verify its features before ctx_dft is touched by the checkpoint restore below
+                tap_pipe.collect(slot.id, (int) accepted.size() - 1, accepted.back());
+
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 
                 const bool use_ckpt_tgt =
@@ -3856,6 +4037,8 @@ private:
                         if (slot.ctx_dft) {
                             ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
+
+                        tap_pipe.abort();
 
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
 

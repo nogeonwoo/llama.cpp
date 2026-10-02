@@ -27,6 +27,7 @@ struct ggml_metal {
     char name[128];
 
     ggml_metal_device_t  dev;
+    id<MTLCommandQueue>  queue;
     ggml_metal_library_t lib;
 
     ggml_metal_event_t ev_cpy; // for async copies
@@ -100,11 +101,13 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
     GGML_LOG_INFO("%s: picking default device: %s\n", __func__, [[device name] UTF8String]);
 
-    // TODO: would it be better to have one queue for the backend and one queue for the device?
-    //       the graph encoders and async ops would use the backend queue while the sync ops would use the device queue?
-    //res->queue = [device newCommandQueue]; [TAG_QUEUE_PER_BACKEND]
-    id<MTLCommandQueue> queue = ggml_metal_device_get_queue(dev);
-    if (queue == nil) {
+    // Allocate an independent MTLCommandQueue for this Metal context to enable true concurrent execution
+    res->queue = [device newCommandQueue];
+    if (res->queue == nil) {
+        GGML_LOG_WARN("%s: failed to create dedicated command queue, falling back to device queue\n", __func__);
+        res->queue = ggml_metal_device_get_queue(dev);
+    }
+    if (res->queue == nil) {
         GGML_LOG_ERROR("%s: error: failed to create command queue\n", __func__);
         return NULL;
     }
@@ -223,7 +226,10 @@ void ggml_metal_free(ggml_metal_t ctx) {
 
     Block_release(ctx->encode_async);
 
-    //[ctx->queue release]; // [TAG_QUEUE_PER_BACKEND]
+    if (ctx->queue && ctx->queue != ggml_metal_device_get_queue(ctx->dev)) {
+        [ctx->queue release];
+        ctx->queue = nil;
+    }
 
     dispatch_release(ctx->d_queue);
 
@@ -323,7 +329,7 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, 
 
         // queue the copy operation into the queue of the Metal context
         // this will be queued at the end, after any currently ongoing GPU operations
-        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+        id<MTLCommandQueue> queue = ctx->queue;
         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
         id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
 
@@ -367,7 +373,7 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
 
         // queue the copy operation into the queue of the Metal context
         // this will be queued at the end, after any currently ongoing GPU operations
-        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+        id<MTLCommandQueue> queue = ctx->queue;
         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
         id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
 
@@ -403,7 +409,7 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
 
         // queue the copy operation into the Metal context
         // this will be queued at the end, after any currently ongoing GPU operations
-        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx_src->dev);
+        id<MTLCommandQueue> queue = ctx_src->queue;
         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
         id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
 
@@ -504,7 +510,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         }
 
         // short-hand
-        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+        id<MTLCommandQueue> queue = ctx->queue;
 
         // the main thread commits the first few commands immediately
         // cmd_buf[n_cb]
@@ -626,7 +632,7 @@ void ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf) {
 
 void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev) {
     @autoreleasepool {
-        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+        id<MTLCommandQueue> queue = ctx->queue;
         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
 
         ggml_metal_event_encode_signal(ev, cmd_buf);
@@ -642,7 +648,7 @@ void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev) {
 
 void ggml_metal_event_wait(ggml_metal_t ctx, ggml_metal_event_t ev) {
     @autoreleasepool {
-        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+        id<MTLCommandQueue> queue = ctx->queue;
         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
 
         ggml_metal_event_encode_wait(ev, cmd_buf);

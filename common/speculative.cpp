@@ -23,6 +23,8 @@
 #include "ngram-map.h"
 #include "ngram-mod.h"
 #include "sampling.h"
+#include "spec-arbiter.h"
+#include "speculative-tap.h"
 
 #include <algorithm>
 #include <cassert>
@@ -30,7 +32,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
+#include <atomic>
+#include <condition_variable>
+#include <functional>
 #include <map>
+#include <mutex>
+#include <thread>
+#include <utility>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_TRC(fmt, ...) LOG_TRC("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -1639,6 +1647,250 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     }
 };
 
+namespace spec {
+
+struct dflash_breakdown_profiler {
+    int64_t t_start_us    = 0;
+    int64_t t_norm_us     = 0;
+    int64_t t_output_us   = 0;
+    int64_t dur_layers_us = 0;
+    int64_t dur_head_us   = 0;
+    int64_t dur_sel_us    = 0;
+    int32_t last_n_tokens = 0;
+    bool    active        = false;
+
+    static bool cb(struct ggml_tensor * t, bool ask, void * user_data) {
+        auto * p = static_cast<dflash_breakdown_profiler *>(user_data);
+        if (!p || !p->active) {
+            return false;
+        }
+        if (ask) {
+            if (std::strcmp(t->name, "result_norm") == 0)   return true;
+            if (std::strcmp(t->name, "result_output") == 0) return true;
+            return false;
+        }
+        const int64_t now = ggml_time_us();
+        if (std::strcmp(t->name, "result_norm") == 0) {
+            p->t_norm_us     = now;
+            p->dur_layers_us = now - p->t_start_us;
+        } else if (std::strcmp(t->name, "result_output") == 0) {
+            p->t_output_us = now;
+            p->dur_head_us = now - p->t_norm_us;
+        }
+        return true;
+    }
+};
+
+static dflash_breakdown_profiler g_dflash_prof;
+
+struct pipe_job {
+    llama_seq_id seq_id      = 0;
+    llama_pos    pos0        = 0;
+    int32_t      n_real      = 0;
+    int32_t      k_exec      = 0;
+    int32_t      k_hyp       = 0;
+    llama_token  anchor      = -1;
+    llama_pos    pos_anchor  = 0;
+    bool         ingest_only = false;
+};
+
+struct pipe_result {
+    bool         ingest_ok = false;
+    bool         draft_ok  = false;
+    llama_tokens tokens;
+    bool         la_valid  = false;
+    llama_token  la_token  = -1;
+    float        draft_ms  = 0.0f;
+    int64_t      t_work_us = 0;
+};
+
+class pipe_engine {
+public:
+    using worker_fn = std::function<void(const pipe_job & job, const std::atomic<bool> & cancel, pipe_result & res)>;
+
+    enum class state : uint8_t {
+        IDLE = 0,
+        DECLARED,
+        RUNNING,
+        FINISHED
+    };
+
+    pipe_engine() = default;
+
+    ~pipe_engine() {
+        shutdown();
+    }
+
+    void start(worker_fn fn) {
+        shutdown();
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            fn_        = std::move(fn);
+            stop_      = false;
+            cancel_    = false;
+            st_        = state::IDLE;
+            in_use_    = false;
+            t_fire_us_ = 0;
+        }
+        worker_ = std::thread([this]() { worker_loop_(); });
+    }
+
+    void shutdown() {
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            if (!worker_.joinable()) {
+                return;
+            }
+            stop_   = true;
+            cancel_ = true;
+            cv_work_.notify_all();
+        }
+        if (worker_.joinable()) {
+            worker_.join();
+        }
+        std::lock_guard<std::mutex> lock(mtx_);
+        st_     = state::IDLE;
+        in_use_ = false;
+        fn_     = nullptr;
+    }
+
+    bool in_use() const noexcept {
+        return in_use_.load(std::memory_order_acquire);
+    }
+
+    bool declare(const pipe_job & job) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (!worker_.joinable() || in_use_.load(std::memory_order_relaxed) || st_ != state::IDLE) {
+            return false;
+        }
+        job_       = job;
+        res_       = pipe_result{};
+        cancel_    = false;
+        t_fire_us_ = 0;
+        st_        = state::DECLARED;
+        in_use_.store(true, std::memory_order_release);
+        return true;
+    }
+
+    void launch() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (st_ != state::DECLARED) {
+            return;
+        }
+        t_fire_us_ = ggml_time_us();
+        st_        = state::RUNNING;
+        cv_work_.notify_one();
+    }
+
+    bool cancel_unlaunched() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (st_ == state::DECLARED) {
+            st_ = state::IDLE;
+            in_use_.store(false, std::memory_order_release);
+            return true;
+        }
+        return false;
+    }
+
+    void abort() {
+        std::unique_lock<std::mutex> lock(mtx_);
+        if (!in_use_.load(std::memory_order_relaxed)) {
+            return;
+        }
+        cancel_.store(true, std::memory_order_release);
+        if (st_ == state::DECLARED) {
+            st_ = state::IDLE;
+            in_use_.store(false, std::memory_order_release);
+            return;
+        }
+        if (st_ == state::RUNNING) {
+            cv_done_.wait(lock, [this]() { return st_ == state::FINISHED || stop_; });
+        }
+        st_ = state::IDLE;
+        in_use_.store(false, std::memory_order_release);
+    }
+
+    bool join(int64_t & wait_us) {
+        const int64_t t0 = ggml_time_us();
+        std::unique_lock<std::mutex> lock(mtx_);
+        if (st_ == state::DECLARED) {
+            wait_us = 0;
+            return false;
+        }
+        if (st_ == state::RUNNING) {
+            cv_done_.wait(lock, [this]() { return st_ == state::FINISHED || stop_; });
+        }
+        wait_us = ggml_time_us() - t0;
+        return st_ == state::FINISHED;
+    }
+
+    const pipe_result & result() const noexcept {
+        return res_;
+    }
+
+    void release() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        st_ = state::IDLE;
+        in_use_.store(false, std::memory_order_release);
+    }
+
+    int64_t t_fire_us() const noexcept {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return t_fire_us_;
+    }
+
+private:
+    void worker_loop_() {
+        while (true) {
+            pipe_job job;
+            worker_fn fn;
+            {
+                std::unique_lock<std::mutex> lock(mtx_);
+                cv_work_.wait(lock, [this]() { return st_ == state::RUNNING || stop_; });
+                if (stop_) {
+                    break;
+                }
+                job = job_;
+                fn  = fn_;
+            }
+
+            pipe_result res;
+            const int64_t t_start = ggml_time_us();
+            try {
+                if (fn) {
+                    fn(job, cancel_, res);
+                }
+            } catch (...) {
+                res.ingest_ok = false;
+                res.draft_ok  = false;
+            }
+            res.t_work_us = ggml_time_us() - t_start;
+
+            {
+                std::lock_guard<std::mutex> lock(mtx_);
+                res_ = std::move(res);
+                st_  = state::FINISHED;
+                cv_done_.notify_all();
+            }
+        }
+    }
+
+    mutable std::mutex      mtx_;
+    std::condition_variable cv_work_;
+    std::condition_variable cv_done_;
+    std::thread             worker_;
+    worker_fn               fn_;
+    pipe_job                job_;
+    pipe_result             res_;
+    std::atomic<bool>       cancel_{false};
+    std::atomic<bool>       in_use_{false};
+    bool                    stop_      = false;
+    state                   st_        = state::IDLE;
+    int64_t                 t_fire_us_ = 0;
+};
+
+} // namespace spec
+
 // DFlash: block-diffusion drafting with a draft-side KV cache injection
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     common_params_speculative_draft params;
@@ -1675,6 +1927,59 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     // scratch buffer for concatenated target features [n_tokens, n_embd_enc]
     std::vector<float> features_buf;
+
+    // Adaptive Speculative Arbiter (Sonnet Phase 3 Final):
+    llama_token                id_think_start       = -1;
+    llama_token                id_think_end         = -1;
+    bool                       arbiter_active       = false; // false = shadow mode (fixed K=1), true = active mode (dynamic K in {0, 1, 3})
+    int                        arbiter_log_interval = 32;    // telemetry logging interval in cycles
+    std::vector<spec::arbiter> arbiters;
+    std::vector<int32_t>       last_k_drafted;
+    std::vector<int64_t>       cycle_count;
+    std::vector<int64_t>       accept_count;
+    std::vector<float>         last_draft_ms;
+
+    // -----------------------------------------------------------------------------------------------------------
+    // Stage S8: asynchronous worker pipeline (public entry points: common_speculative_pipeline_* in speculative-tap.h)
+    //
+    // Ownership rule: ctx_dft, batch, batch_inject, features_buf and smpls[] belong to exactly one thread at a time.
+    // The main thread owns them except between engine.launch() (tap callback) and engine.join()/abort(); in that
+    // window only pipe_work() may touch them. process() is the one main-thread path that could violate this and it
+    // returns early while a worker job is in use. The worker never touches the arbiter.
+    // -----------------------------------------------------------------------------------------------------------
+    struct pipe_cycle {
+        bool         valid       = false;  // an anchor guess exists for the batch being verified
+        bool         job         = false;  // a worker job was declared (and, after disarm, launched) for it
+        llama_seq_id seq_id      = 0;
+        llama_pos    pos0        = 0;
+        int32_t      n_real      = 0;
+        int32_t      k_exec      = 0;
+        int32_t      k_hyp       = 0;      // K the worker drafts for (hypothesis for the next cycle)
+        llama_token  anchor      = -1;
+        bool         ingest_only = false;
+    };
+
+    spec::layer_tap * tap              = nullptr;
+    spec::pipe_engine engine;
+    spec::pipe_stats  pstats;
+    bool              pipe_attached    = false;
+    bool              pipe_ingest_only = false;
+
+    // lookahead anchor left by the last draft()/take(): the guess for id_last of the cycle after the batch about to be verified
+    bool        la_valid = false;
+    llama_token la_token = -1;
+    int32_t     la_k     = 0;
+
+    pipe_cycle  cyc;
+
+    // worker draft handed from collect() to take()
+    bool         take_ready    = false;
+    int32_t      take_k        = 0;      // K the worker drafted for
+    llama_token  take_id       = -1;     // actual bonus token == anchor (hit)
+    llama_tokens take_tokens;
+    bool         take_la_valid = false;
+    llama_token  take_la_token = -1;
+    float        take_draft_ms = 0.0f;
 
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
@@ -1729,6 +2034,63 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // and reads as a bad drafter instead of a bad conversion that dropped the vocab
         GGML_ASSERT(mask_token_id != LLAMA_TOKEN_NULL &&
                     "draft model has no mask token: check tokenizer.ggml.mask_token_id and tokenizer.ggml.model (a 'none' stub skips the vocab) in the GGUF");
+
+        // Initialize Adaptive Speculative Arbiter (Phase 4 Specification)
+        const char * env_mode = std::getenv("LLAMA_SPEC_ARBITER_MODE");
+        std::string arbiter_mode_str = env_mode ? env_mode : "shadow";
+
+        spec::arbiter_mode op_mode = spec::arbiter_mode::SHADOW;
+        if (arbiter_mode_str == "active") op_mode = spec::arbiter_mode::ACTIVE;
+        else if (arbiter_mode_str == "auto") op_mode = spec::arbiter_mode::AUTO;
+
+        const char * env_interval = std::getenv("LLAMA_SPEC_ARBITER_LOG_INTERVAL");
+        if (env_interval) {
+            arbiter_log_interval = std::max(1, std::atoi(env_interval));
+        }
+
+        const char * env_drafter = std::getenv("LLAMA_SPEC_DRAFTER");
+        spec::drafter_kind dkind = spec::drafter_kind::BLOCK;
+        if (env_drafter && std::string(env_drafter) == "ar") {
+            dkind = spec::drafter_kind::AUTOREGRESSIVE;
+        }
+
+        const llama_vocab * vocab_tgt = llama_model_get_vocab(model_tgt);
+        auto tok_s = common_tokenize(vocab_tgt, "<think>", false, true);
+        if (!tok_s.empty()) id_think_start = tok_s[0];
+        auto tok_e = common_tokenize(vocab_tgt, "</think>", false, true);
+        if (!tok_e.empty()) id_think_end = tok_e[0];
+
+        spec::arbiter_params aparams;
+        aparams.op_mode  = op_mode;
+        aparams.drafter  = dkind;
+        aparams.id_open  = id_think_start;
+        aparams.id_close = id_think_end;
+        aparams.allow_k2 = false; // K=2 is dominated on M3
+        aparams.force_k0_in_think = false; // let the mathematical model decide
+
+        const char * env_pipe = std::getenv("LLAMA_SPEC_PIPELINE");
+        if (env_pipe && (std::strcmp(env_pipe, "1") == 0 || std::strcmp(env_pipe, "true") == 0)) {
+            aparams.pipelined = true;
+        }
+
+        const char * env_pmode = std::getenv("LLAMA_SPEC_PIPE_MODE");
+        if (env_pmode && (std::strcmp(env_pmode, "ingest") == 0 || std::strcmp(env_pmode, "b0") == 0)) {
+            pipe_ingest_only = true;
+            LOG_INF("%s: Stage S8 Path B0 (ingest-only pipeline) enabled\n", __func__);
+        }
+
+        arbiters.clear();
+        for (uint32_t s = 0; s < n_seq; ++s) {
+            arbiters.emplace_back(aparams);
+        }
+        last_k_drafted.assign(n_seq, 1);
+        cycle_count.assign(n_seq, 0);
+        accept_count.assign(n_seq, 0);
+        last_draft_ms.assign(n_seq, 0.0f);
+
+        LOG_INF("%s: speculative arbiter initialized (mode=%s, drafter=%s, think_start=%d, think_end=%d, log_interval=%d, n_seq=%u)\n",
+                __func__, arbiter_mode_str.c_str(), dkind == spec::drafter_kind::BLOCK ? "block" : "ar",
+                id_think_start, id_think_end, arbiter_log_interval, n_seq);
 
         LOG_INF("%s: adding speculative implementation '%s'\n", __func__, common_speculative_type_to_str(type).c_str());
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
@@ -1792,6 +2154,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 
     ~common_speculative_impl_draft_dflash() override {
+        engine.shutdown(); // the worker owns ctx_dft while a job runs: join it first
+
         auto * ctx_dft = this->params.ctx_dft;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
@@ -1804,13 +2168,616 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
         backend_chains.clear();
 
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) arbiters.size(); ++seq_id) {
+            LOG_INF("[arbiter-audit seq=%d] total_draft_cycles=%lld total_arbiter_updates=%lld (1:1 lockstep: %s)\n",
+                    (int) seq_id, (long long) cycle_count[seq_id], (long long) accept_count[seq_id],
+                    cycle_count[seq_id] == accept_count[seq_id] ? "VERIFIED" : "MISMATCH");
+        }
+
         llama_batch_free(batch);
         llama_batch_free(batch_inject);
     }
 
+    // ---- Stage S8 pipeline internals -----------------------------------------------------------------------------
+
+    // Encode + inject `n_rows` rows of target features into the draft KV cache.
+    //   layer_rows[k] : row 0 of extract layer k, [n_rows, n_embd_tgt] f32, row stride n_embd_tgt
+    //   pos[i]        : target position of row i
+    // Shared by process() (rows from llama_get_embeddings_layer_inp) and the worker (rows from the tap).
+    bool ingest_rows(llama_seq_id seq_id, int32_t n_rows, const std::vector<const float *> & layer_rows, const llama_pos * pos) {
+        auto * ctx_dft = this->params.ctx_dft;
+
+        const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
+
+        for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
+            const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
+
+            // gather this chunk's target features, interleaved by extract layer
+            features_buf.resize((size_t) n_chunk * n_embd_enc);
+            for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                for (int32_t i = 0; i < n_chunk; ++i) {
+                    float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
+                    const float * src = layer_rows[k] + (size_t) (offset + i) * n_embd_tgt;
+                    std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+                }
+            }
+
+            // fuse extracted features through DFlash encoder
+            // M-RoPE drafts read 4 position rows per token from embd batches, so pass them explicitly
+            std::vector<llama_pos> enc_pos;
+            if (is_mrope) {
+                enc_pos.resize((size_t) 4 * n_chunk);
+                for (int32_t i = 0; i < n_chunk; ++i) {
+                    const llama_pos p = pos[offset + i];
+                    enc_pos[0 * n_chunk + i] = p;
+                    enc_pos[1 * n_chunk + i] = p;
+                    enc_pos[2 * n_chunk + i] = p;
+                    enc_pos[3 * n_chunk + i] = 0;
+                }
+            }
+
+            llama_batch enc_batch = {
+                /*.n_tokens =*/ n_chunk,
+                /*.token    =*/ nullptr,
+                /*.embd     =*/ features_buf.data(),
+                /*.pos      =*/ is_mrope ? enc_pos.data() : nullptr,
+                /*.n_seq_id =*/ nullptr,
+                /*.seq_id   =*/ nullptr,
+                /*.logits   =*/ nullptr,
+            };
+
+            int32_t rc = llama_encode(ctx_dft, enc_batch);
+            if (rc != 0) {
+                LOG_ERR("%s: llama_encode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
+                        __func__, rc, (int) n_chunk, (int) offset);
+                return false;
+            }
+
+            const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
+            GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
+
+            // inject the DFlash decoder K/V cache at the tokens' target positions
+            batch_inject.n_tokens = n_chunk;
+            std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
+
+            for (int32_t i = 0; i < n_chunk; ++i) {
+                const llama_pos p = pos[offset + i];
+                batch_inject.pos[i] = p;
+                if (is_mrope) {
+                    batch_inject.pos[1 * n_chunk + i] = p;
+                    batch_inject.pos[2 * n_chunk + i] = p;
+                    batch_inject.pos[3 * n_chunk + i] = 0;
+                }
+                batch_inject.n_seq_id[i]  = 1;
+                batch_inject.seq_id[i][0] = seq_id;
+                batch_inject.logits[i]    = false;
+            }
+            rc = llama_decode(ctx_dft, batch_inject);
+            if (rc != 0) {
+                LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
+                        __func__, rc, (int) n_chunk, (int) offset);
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    // arbiter telemetry line, shared by draft() and take()
+    void log_arbiter(llama_seq_id seq_id, int k_pred, int k_actual) {
+        if (cycle_count[seq_id] % arbiter_log_interval == 0) {
+            const auto snap = arbiters[seq_id].snapshot(arbiters[seq_id].in_think() ? spec::mode::think : spec::mode::content);
+            LOG_INF("[spec-arbiter seq=%d cyc=%lld phase=%s mode=%s%s] K_pred=%d K_act=%d | td0=%.1fms td=%.2fms | slack13=%.3f lcb=%.3f beta=%.2f | c=(%.3f, %.3f, %.3f) | TPS K0..3=[%.2f, %.2f, %.2f, %.2f]\n",
+                    (int) seq_id, (long long) cycle_count[seq_id],
+                    arbiters[seq_id].in_think() ? "THINK" : "CONTENT",
+                    snap.is_active ? "active" : "shadow",
+                    arbiters[seq_id].get_mode() == spec::arbiter_mode::AUTO ? (snap.is_active ? "(promoted)" : "(evaluating)") : "",
+                    k_pred, k_actual,
+                    snap.t_d0, snap.t_d,
+                    snap.slack13, snap.lcb, snap.beta_t,
+                    snap.c[0], snap.c[1], snap.c[2],
+                    snap.tps[0], snap.tps[1], snap.tps[2], snap.tps[3]);
+        }
+    }
+
+    // Reads the drafted block that llama_decode(ctx_dft) just produced for one sequence into `result`.
+    // `beg` is the batch row of the block's first token. Moved verbatim out of draft() so the worker can reuse it.
+    void read_block_result(llama_seq_id seq_id, int32_t beg, int32_t n_block_tokens, llama_tokens & result) {
+        auto & ctx_dft = params.ctx_dft;
+        auto * smpl    = smpls[seq_id].get();
+
+        if (is_dflash2) {
+            const float * lattice = llama_get_embeddings_nextn(ctx_dft);
+            GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
+
+            int32_t predecessor = 0;
+            for (int32_t i = 1; i < n_block_tokens; ++i) {
+                const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
+                const float * scores = row + selector_top_k + (size_t) predecessor * selector_top_k;
+
+                predecessor = (int32_t) std::distance(scores,
+                        std::max_element(scores, scores + selector_top_k));
+                if (params.p_min > 0.0f) {
+                    // softmax(scores) at the argmax, i.e. 1 / sum(exp(s_k - s_max))
+                    float sum = 0.0f;
+                    for (int32_t k = 0; k < selector_top_k; ++k) {
+                        sum += std::exp(scores[k] - scores[predecessor]);
+                    }
+                    if (1.0f / sum < params.p_min) {
+                        break;
+                    }
+                }
+                result.push_back((llama_token) row[predecessor]);
+            }
+
+            if (result.size() < (size_t) params.n_min) {
+                result.clear();
+            }
+            return;
+        }
+
+        if (is_dspark) {
+            // DSpark: read from the first draft slot, truncate below the confidence threshold
+            const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+            // bonus-anchor drafts read the mask positions only, like DFlash
+            const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;
+            for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
+                const int32_t idx = beg + i;
+
+                if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
+                    break;
+                }
+
+                common_sampler_sample(smpl, ctx_dft, idx, true);
+
+                const auto * cur_p = common_sampler_get_candidates(smpl, true);
+
+                for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+                    LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
+                            seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
+                            common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                }
+
+                const llama_token id = cur_p->data[0].id;
+
+                common_sampler_accept(smpl, id, true);
+
+                result.push_back(id);
+            }
+        } else {
+            // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1
+            for (int32_t i = 1; i < n_block_tokens; ++i) {
+                common_sampler_sample(smpl, ctx_dft, beg + i, true);
+
+                const auto * cur_p = common_sampler_get_candidates(smpl, true);
+
+                for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+                    LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
+                            seq_id, k, i - 1, cur_p->data[k].id, cur_p->data[k].p,
+                            common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                }
+
+                const llama_token id = cur_p->data[0].id;
+
+                if (cur_p->data[0].p < params.p_min) {
+                    break;
+                }
+
+                common_sampler_accept(smpl, id, true);
+
+                result.push_back(id);
+            }
+        }
+
+        if (result.size() < (size_t) params.n_min) {
+            result.clear();
+        }
+
+    }
+
+    // Single-sequence noise-block draft for the worker. Same batch layout as draft(); touches ctx_dft, batch and
+    // smpls[seq_id] only, never the arbiter. Leaves no noise rows in the draft KV cache.
+    bool draft_block(llama_seq_id seq_id, llama_token id_anchor, llama_pos pos_anchor, int32_t n_draft,
+            llama_tokens & result, float & total_ms) {
+        auto & ctx_dft = params.ctx_dft;
+
+        common_batch_clear(batch);
+        common_sampler_reset(smpls[seq_id].get());
+
+        const int32_t n_block_tokens = n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
+        for (int32_t i = 0; i < n_block_tokens; ++i) {
+            common_batch_add(batch, i == 0 ? id_anchor : mask_token_id, pos_anchor + i, { seq_id }, !is_dflash2);
+        }
+
+        const int64_t t0 = ggml_time_us();
+        const int ret = llama_decode(ctx_dft, batch);
+        const int64_t t1 = ggml_time_us();
+        llama_synchronize(ctx_dft);
+        const int64_t t2 = ggml_time_us();
+        total_ms = (t2 - t0) / 1000.0f;
+        const float enq_ms  = (t1 - t0) / 1000.0f;
+        const float sync_ms = (t2 - t1) / 1000.0f;
+        LOG_INF("[dflash-worker-timer] batch_tokens=%d total_td=%.2f ms (cpu_enq=%.2f ms, gpu_sync=%.2f ms)\n",
+                (int) batch.n_tokens, total_ms, enq_ms, sync_ms);
+        if (ret != 0) {
+            LOG_WRN("%s: llama_decode(ctx_dft) returned %d\n", __func__, ret);
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, pos_anchor, -1);
+            return false;
+        }
+
+        read_block_result(seq_id, 0, n_block_tokens, result);
+
+        // the block rows are scratch: drop them so the draft KV cache holds only target-feature rows
+        return llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, pos_anchor, -1);
+    }
+
+    bool pipe_lookahead_allowed() const {
+        if (pipe_ingest_only) {
+            return false;
+        }
+        const char * env = std::getenv("LLAMA_SPEC_LOOKAHEAD");
+        return env ? (std::atoi(env) != 0) : true;
+    }
+
+    // K the arbiter would pick right now, without side effects (hypothesis for cycle N+1)
+    int32_t pipe_k_peek(llama_seq_id seq_id) const {
+        if (const char * env_force_k = std::getenv("LLAMA_SPEC_FORCE_K")) {
+            return std::atoi(env_force_k);
+        }
+        return arbiters[seq_id].select_k();   // const overload
+    }
+
+    // true when the worker already ingested the rows of this verify batch (so process() must not touch ctx_dft)
+    bool pipe_owns_ingest(const llama_batch & b) const {
+        if (!pipe_attached || !cyc.job) {
+            return false;
+        }
+        if (b.n_tokens != cyc.n_real || b.pos == nullptr || b.pos[0] != cyc.pos0) {
+            return false;
+        }
+        return engine.in_use();
+    }
+
+    // worker body: runs on the worker thread, owns ctx_dft for its duration
+    void pipe_work(const spec::pipe_job & job, const std::atomic<bool> & cancel, spec::pipe_result & res) {
+        const int64_t t0 = ggml_time_us();
+
+        // 1. ingest rows [0, n_real) straight from the tap host copies (no second pass through process())
+        std::vector<const float *> rows(target_layer_ids_n);
+        for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+            rows[k] = tap->rows(k);
+        }
+        std::vector<llama_pos> pos((size_t) job.n_real);
+        for (int32_t i = 0; i < job.n_real; ++i) {
+            pos[i] = job.pos0 + i;
+        }
+        res.ingest_ok = ingest_rows(job.seq_id, job.n_real, rows, pos.data());
+        if (!res.ingest_ok || cancel.load() || job.ingest_only) {
+            res.t_work_us = ggml_time_us() - t0;
+            return;
+        }
+
+        // 2. hypothesis draft for cycle N+1: [anchor, <mask> * ...] at pos_anchor.. ; the extra (lookahead) row carries
+        //    the anchor guess for cycle N+2, its cost is hidden behind the remaining target layers
+        const int32_t k_hyp   = job.k_hyp;
+        const bool    want_la = pipe_lookahead_allowed() && k_hyp + 1 <= (int32_t) params.n_max;
+        const int32_t n_draft = want_la ? k_hyp + 1 : k_hyp;
+
+        llama_tokens toks;
+        res.draft_ok = draft_block(job.seq_id, job.anchor, job.pos_anchor, n_draft, toks, res.draft_ms);
+
+        if (want_la && toks.size() == (size_t) k_hyp + 1) {
+            res.la_token = toks.back();
+            res.la_valid = true;
+            toks.pop_back();
+        }
+        if (toks.size() < (size_t) params.n_min) {
+            toks.clear();
+            res.la_valid = false;
+        }
+        res.tokens = std::move(toks);
+    }
+
+    // bit-exact check of the tap host copies against what llama_decode published for the same batch
+    bool pipe_features_match(int32_t n_real) const {
+        if (tap->n_embd() != n_embd_tgt) {
+            return false;
+        }
+        for (size_t k = 0; k < tap->n_slots(); ++k) {
+            const float * direct = llama_get_embeddings_layer_inp(params.ctx_tgt, tap->slot_layer(k));
+            if (direct == nullptr) {
+                return false;
+            }
+            if (std::memcmp(tap->rows(k), direct, (size_t) n_real * (size_t) n_embd_tgt * sizeof(float)) != 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // the worker ingested bad/partial rows: drop them and ingest the rows llama_decode published (sequential semantics)
+    bool pipe_reingest(const pipe_cycle & c) {
+        auto * ctx_dft = params.ctx_dft;
+        auto * ctx_tgt = params.ctx_tgt;
+        llama_memory_seq_rm(llama_get_memory(ctx_dft), c.seq_id, c.pos0, -1);
+
+        std::vector<const float *> rows(target_layer_ids_n);
+        for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+            rows[k] = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+            if (rows[k] == nullptr) {
+                return false;
+            }
+        }
+        std::vector<llama_pos> pos((size_t) c.n_real);
+        for (int32_t i = 0; i < c.n_real; ++i) {
+            pos[i] = c.pos0 + i;
+        }
+        return ingest_rows(c.seq_id, c.n_real, rows, pos.data());
+    }
+
+    bool pipe_attach(spec::layer_tap * t) {
+        if (t == nullptr || pipe_attached) {
+            return pipe_attached;
+        }
+        if (n_seq != 1 || arbiters.size() != 1 || !arbiters[0].is_pipelined()) {
+            return false;
+        }
+        const auto rm_dft = common_context_can_seq_rm(params.ctx_dft);
+        if (rm_dft == COMMON_CONTEXT_SEQ_RM_TYPE_NO || rm_dft == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+            rm_dft == COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
+            LOG_WRN("%s: draft context cannot drop a tail of positions: pipeline disabled\n", __func__);
+            return false;
+        }
+        t->configure(target_layer_ids, target_layer_ids_n, n_embd_tgt);
+        if (!t->configured() || t->n_slots() != target_layer_ids_n || t->n_embd() != n_embd_tgt) {
+            return false;
+        }
+        tap = t;
+        engine.start([this](const spec::pipe_job & job, const std::atomic<bool> & cancel, spec::pipe_result & res) {
+            pipe_work(job, cancel, res);
+        });
+        pipe_attached = true;
+        LOG_INF("%s: DFlash worker pipeline attached (n_slots=%zu, n_embd=%d)\n", __func__, t->n_slots(), (int) n_embd_tgt);
+        return true;
+    }
+
+    bool pipe_arm(llama_seq_id seq_id, llama_pos pos0, int32_t n_real, int32_t k_exec) {
+        if (!pipe_attached || seq_id != 0) {
+            la_valid = false;
+            return false;
+        }
+        if (engine.in_use()) {
+            engine.abort();   // defensive: the caller skipped collect()
+        }
+        cyc = pipe_cycle{};
+
+        if (pipe_ingest_only) {
+            if (k_exec < 1 || n_real != k_exec + 1 || pstats.disabled || !tap->configured()) {
+                return false;
+            }
+            cyc.valid       = true;
+            cyc.seq_id      = seq_id;
+            cyc.pos0        = pos0;
+            cyc.n_real      = n_real;
+            cyc.k_exec      = k_exec;
+            cyc.ingest_only = true;
+
+            spec::pipe_job job;
+            job.seq_id      = seq_id;
+            job.pos0        = pos0;
+            job.n_real      = n_real;
+            job.k_exec      = k_exec;
+            job.ingest_only = true;
+            if (!engine.declare(job)) {
+                return false;
+            }
+            cyc.job = true;
+            tap->arm(n_real, [this]() { engine.launch(); });
+            return true;
+        }
+
+        // the anchor must belong to exactly this batch
+        const bool anchor_ok = la_valid && la_k == k_exec && k_exec >= 1 && n_real == k_exec + 1;
+        la_valid = false;
+        if (!anchor_ok) {
+            return false;
+        }
+        cyc.valid  = true;
+        cyc.seq_id = seq_id;
+        cyc.pos0   = pos0;
+        cyc.n_real = n_real;
+        cyc.k_exec = k_exec;
+        cyc.anchor = la_token;   // still holds the value draft()/take() stored
+
+        if (pstats.disabled || !tap->configured()) {
+            return false;        // anchor is still tracked so the arbiter keeps learning g
+        }
+
+        const int32_t k_hyp = std::min(pipe_k_peek(seq_id), (int32_t) params.n_max);
+        if (k_hyp < 1) {
+            return false;
+        }
+
+        cyc.k_hyp = k_hyp;
+
+        spec::pipe_job job;
+        job.seq_id     = seq_id;
+        job.pos0       = pos0;
+        job.n_real     = n_real;
+        job.k_exec     = k_exec;
+        job.k_hyp      = k_hyp;
+        job.anchor     = cyc.anchor;
+        job.pos_anchor = pos0 + n_real;
+        if (!engine.declare(job)) {
+            return false;
+        }
+        cyc.job = true;
+        tap->arm(n_real, [this]() { engine.launch(); });
+        return true;
+    }
+
+    void pipe_disarm(int64_t t_decode_end_us) {
+        if (tap == nullptr) {
+            return;
+        }
+        if (cyc.job) {
+            if (engine.cancel_unlaunched()) {
+                // armed, but the boundary node never fired or the capture was rejected: nothing was handed over
+                pstats.tap_fail++;
+                cyc.job = false;
+            } else {
+                pstats.submitted++;
+                const int64_t t_fire = engine.t_fire_us();
+                if (t_fire > 0 && t_decode_end_us > t_fire) {
+                    pstats.t_window_us += t_decode_end_us - t_fire;
+                }
+            }
+        }
+        tap->disarm();
+    }
+
+    void pipe_collect(llama_seq_id seq_id, int n_accepted, llama_token id_last_actual) {
+        // whatever collect() produced for the previous cycle is stale now
+        take_ready = false;
+        take_tokens.clear();
+
+        if (!pipe_attached || !cyc.valid) {
+            return;
+        }
+        const pipe_cycle c = cyc;
+        cyc = pipe_cycle{};
+
+        const bool all_accepted = n_accepted == c.k_exec;
+        const bool anchor_match = all_accepted && id_last_actual == c.anchor;
+        if (!c.ingest_only && all_accepted) {
+            arbiters[seq_id].report_anchor(anchor_match);   // g = P(anchor == bonus | all K accepted)
+        }
+        if (!c.job) {
+            return;
+        }
+
+        // join first: ctx_dft goes back to the main thread on every outcome
+        int64_t wait_us = 0;
+        const bool have = engine.join(wait_us);
+        pstats.t_wait_us += wait_us;
+        if (!have) {
+            return;
+        }
+        const spec::pipe_result & r = engine.result();
+        pstats.t_worker_us += r.t_work_us;
+
+        // the worker ingested rows from the tap; they are shared by every outcome, so verify them always
+        if (!r.ingest_ok || !pipe_features_match(c.n_real)) {
+            pstats.verify_fail++;
+            pstats.disabled = true;
+            LOG_ERR("%s: tap features rejected (ingest_ok=%d); pipeline disabled, re-ingesting sequentially\n",
+                    __func__, (int) r.ingest_ok);
+            if (!pipe_reingest(c)) {
+                LOG_ERR("%s: sequential re-ingest failed; draft quality will degrade\n", __func__);
+            }
+            engine.release();
+            return;
+        }
+
+        if (c.ingest_only) {
+            pstats.ingest_jobs++;
+            engine.release();
+            return;
+        }
+
+        if (!all_accepted) {
+            pstats.miss_accept++;
+        } else if (!anchor_match) {
+            pstats.miss_anchor++;
+        } else if (!r.draft_ok || r.tokens.empty()) {
+            pstats.miss_empty++;
+        } else {
+            take_ready    = true;
+            take_k        = c.k_hyp;           // the K the worker drafted for; take() compares it with the arbiter's K
+            take_id       = id_last_actual;    // == anchor
+            take_tokens   = r.tokens;
+            take_la_valid = r.la_valid;
+            take_la_token = r.la_token;
+            take_draft_ms = r.draft_ms;
+        }
+        engine.release();
+    }
+
+    bool pipe_take(llama_seq_id seq_id, int n_draft_max, llama_tokens & out) {
+        if (!pipe_attached || !take_ready || seq_id != 0) {
+            return false;
+        }
+        take_ready = false;
+        if (pstats.disabled || take_tokens.empty()) {
+            take_tokens.clear();
+            return false;
+        }
+
+        auto & arb = arbiters[seq_id];
+        arb.feed_token_id(take_id);
+
+        const int k_pred   = arb.pred_k();
+        int       k_actual = arb.select_k();
+        if (const char * env_force_k = std::getenv("LLAMA_SPEC_FORCE_K")) {
+            k_actual = std::atoi(env_force_k);
+        }
+        const int32_t k_eff = std::min((int32_t) k_actual, (int32_t) params.n_max);
+
+        // the sequential path decides these cases itself (it re-reads the arbiter and the generation budget)
+        if (k_eff != take_k || n_draft_max < (int) take_tokens.size()) {
+            pstats.miss_k++;
+            take_tokens.clear();
+            return false;
+        }
+
+        cycle_count[seq_id]++;
+        last_k_drafted[seq_id] = is_dflash2 ? (int32_t) k_actual : (int32_t) take_tokens.size();
+        last_draft_ms [seq_id] = take_draft_ms;
+        log_arbiter(seq_id, k_pred, k_actual);
+
+        // the worker's lookahead row is the anchor guess for the batch we are about to verify
+        la_valid = take_la_valid;
+        la_token = take_la_token;
+        la_k     = (int32_t) take_tokens.size();
+
+        out = std::move(take_tokens);
+        take_tokens.clear();
+        pstats.hits++;
+        return true;
+    }
+
+    // drop any in-flight / ready hypothesis (error paths, checkpoint restores); ctx_dft is back with the caller on return
+    void pipe_abort() {
+        if (pipe_attached) {
+            engine.abort();
+        }
+        cyc = pipe_cycle{};
+        take_ready = false;
+        take_tokens.clear();
+        la_valid = false;
+        if (tap != nullptr) {
+            tap->disarm();
+        }
+    }
+
+
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
+        }
+
+        if (pipe_attached) {
+            pipe_abort();
+        }
+
+        if (seq_id < (llama_seq_id) arbiters.size()) {
+            arbiters[seq_id].reset(false);
+            for (auto t : prompt) {
+                arbiters[seq_id].feed_token_id(t);
+            }
+            last_k_drafted[seq_id] = 1;
+            cycle_count[seq_id] = 0;
+            last_draft_ms[seq_id] = 0.0f;
         }
 
         const int32_t N = (int32_t) prompt.size();
@@ -1844,6 +2811,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         const int32_t n_tokens = batch_in.n_tokens;
 
+        // Stage S8: the worker ingested exactly these rows from the tap and owns ctx_dft until collect() joins it
+        if (pipe_owns_ingest(batch_in)) {
+            return true;
+        }
+
         // per-seq inclusive batch range (assumes each seq's tokens are contiguous in the batch)
         std::vector<int32_t> i_batch_beg(n_seq, -1);
         std::vector<int32_t> i_batch_end(n_seq, -1);
@@ -1860,9 +2832,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         auto * ctx_tgt = this->params.ctx_tgt;
-        auto * ctx_dft = this->params.ctx_dft;
-
-        const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_beg[seq_id] < 0) {
@@ -1870,79 +2839,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
 
-            for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
-                const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
-
-                // gather this chunk's target features, interleaved by extract layer
-                features_buf.resize((size_t) n_chunk * n_embd_enc);
-                for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-                    const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
-                    if (!layer) {
-                        GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
-                    }
-                    for (int32_t i = 0; i < n_chunk; ++i) {
-                        float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
-                        const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
-                        std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
-                    }
+            std::vector<const float *> layer_rows(target_layer_ids_n);
+            for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                if (!layer) {
+                    GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
                 }
+                layer_rows[k] = layer + (size_t) i_batch_beg[seq_id] * n_embd_tgt;
+            }
 
-                // fuse extracted features through DFlash encoder
-                // M-RoPE drafts read 4 position rows per token from embd batches, so pass them explicitly
-                std::vector<llama_pos> enc_pos;
-                if (is_mrope) {
-                    enc_pos.resize((size_t) 4 * n_chunk);
-                    for (int32_t i = 0; i < n_chunk; ++i) {
-                        const llama_pos p = batch_in.pos[i_batch_beg[seq_id] + offset + i];
-                        enc_pos[0 * n_chunk + i] = p;
-                        enc_pos[1 * n_chunk + i] = p;
-                        enc_pos[2 * n_chunk + i] = p;
-                        enc_pos[3 * n_chunk + i] = 0;
-                    }
-                }
-
-                llama_batch enc_batch = {
-                    /*.n_tokens =*/ n_chunk,
-                    /*.token    =*/ nullptr,
-                    /*.embd     =*/ features_buf.data(),
-                    /*.pos      =*/ is_mrope ? enc_pos.data() : nullptr,
-                    /*.n_seq_id =*/ nullptr,
-                    /*.seq_id   =*/ nullptr,
-                    /*.logits   =*/ nullptr,
-                };
-
-                int32_t rc = llama_encode(ctx_dft, enc_batch);
-                if (rc != 0) {
-                    LOG_ERR("%s: llama_encode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
-                            __func__, rc, (int) n_chunk, (int) offset);
-                    return false;
-                }
-
-                const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
-                GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
-
-                // inject the DFlash decoder K/V cache at the tokens' target positions
-                batch_inject.n_tokens = n_chunk;
-                std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
-
-                for (int32_t i = 0; i < n_chunk; ++i) {
-                    const llama_pos p = batch_in.pos[i_batch_beg[seq_id] + offset + i];
-                    batch_inject.pos[i] = p;
-                    if (is_mrope) {
-                        batch_inject.pos[1 * n_chunk + i] = p;
-                        batch_inject.pos[2 * n_chunk + i] = p;
-                        batch_inject.pos[3 * n_chunk + i] = 0;
-                    }
-                    batch_inject.n_seq_id[i]  = 1;
-                    batch_inject.seq_id[i][0] = seq_id;
-                    batch_inject.logits[i]    = false;
-                }
-                rc = llama_decode(ctx_dft, batch_inject);
-                if (rc != 0) {
-                    LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
-                            __func__, rc, (int) n_chunk, (int) offset);
-                    return false;
-                }
+            if (!ingest_rows(seq_id, n_rows, layer_rows, batch_in.pos + i_batch_beg[seq_id])) {
+                return false;
             }
         }
 
@@ -1958,6 +2865,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // record where each block starts and its size
         std::vector<int32_t> i_block_beg(n_seq, -1);
         std::vector<int32_t> n_block    (n_seq,  0);
+        std::vector<uint8_t> la_requested(n_seq, 0);   // lookahead row appended to this seq's block
+        std::vector<int32_t> k_eff_seq   (n_seq, 0);
+
+        la_valid = false;                              // a stale anchor must never survive a draft
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
@@ -1965,11 +2876,48 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 continue;
             }
 
+            // Adaptive Speculative Arbiter (Phase 4 Specification):
+            int k_pred = 1;
+            int k_actual = 1;
+            if (seq_id < (llama_seq_id) arbiters.size()) {
+                arbiters[seq_id].feed_token_id(dp.id_last);
+
+                k_pred = arbiters[seq_id].pred_k();
+                k_actual = arbiters[seq_id].select_k();
+
+                const char * env_force_k = std::getenv("LLAMA_SPEC_FORCE_K");
+                if (env_force_k) {
+                    k_actual = std::atoi(env_force_k);
+                }
+
+                last_k_drafted[seq_id] = k_actual;
+                cycle_count[seq_id]++;
+
+                log_arbiter(seq_id, k_pred, k_actual);
+            }
+
+            if (k_actual == 0) {
+                last_k_drafted[seq_id] = 0;
+                continue;
+            }
+
             common_sampler_reset(smpls[seq_id].get());
 
             const int32_t n = (int32_t) dp.n_past;
 
-            const int32_t n_draft = params.n_max;
+            const int32_t k_eff   = std::min(k_actual, (int32_t) params.n_max);
+            int32_t       n_draft = k_eff;
+            if (pipe_attached && !pstats.disabled && seq_id == 0 && k_eff > 0 && pipe_lookahead_allowed()) {
+                // P1 gate: pay the lookahead tax (one extra block row) only when the expected overlap gain covers it
+                if (k_eff + 1 <= (int32_t) params.n_max && arbiters[seq_id].lookahead_worth(k_eff)) {
+                    n_draft              = k_eff + 1;
+                    la_requested[seq_id] = 1;
+                    k_eff_seq[seq_id]    = k_eff;
+                    pstats.la_on_seq++;
+                } else {
+                    pstats.la_off_seq++;
+                }
+            }
 
             const int32_t n_block_tokens = n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.n_tokens;
@@ -1984,7 +2932,35 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         // decode all sequence's noise block in a single batch
+        if (spec::g_dflash_prof.active) {
+            spec::g_dflash_prof.t_start_us    = ggml_time_us();
+            spec::g_dflash_prof.t_norm_us     = 0;
+            spec::g_dflash_prof.t_output_us   = 0;
+            spec::g_dflash_prof.last_n_tokens = (int32_t) batch.n_tokens;
+        }
+        const int64_t t_draft_start_us = ggml_time_us();
         int ret = llama_decode(ctx_dft, batch);
+        const int64_t t_draft_enq_us = ggml_time_us() - t_draft_start_us;
+
+        const int64_t t_sync_start_us = ggml_time_us();
+        llama_synchronize(ctx_dft);
+        const int64_t t_draft_sync_us = ggml_time_us() - t_sync_start_us;
+        const int64_t t_draft_end_us  = ggml_time_us();
+
+        const float enq_ms  = t_draft_enq_us / 1000.0f;
+        const float sync_ms = t_draft_sync_us / 1000.0f;
+        const float total_d_ms = (t_draft_end_us - t_draft_start_us) / 1000.0f;
+        LOG_INF("[dflash-timer] batch_tokens=%d draft_cpu_enq=%.2f ms draft_gpu_sync=%.2f ms total_td=%.2f ms\n",
+                (int)batch.n_tokens, enq_ms, sync_ms, total_d_ms);
+        if (spec::g_dflash_prof.active && spec::g_dflash_prof.t_output_us > 0) {
+            spec::g_dflash_prof.dur_sel_us = t_draft_end_us - spec::g_dflash_prof.t_output_us;
+            LOG_INF("[dflash-breakdown] batch_tokens=%d | layers (norm)=%6.2f ms | lm_head (output)=%6.2f ms | selector (lattice)=%6.2f ms | total=%6.2f ms\n",
+                    spec::g_dflash_prof.last_n_tokens,
+                    spec::g_dflash_prof.dur_layers_us / 1000.0f,
+                    spec::g_dflash_prof.dur_head_us   / 1000.0f,
+                    spec::g_dflash_prof.dur_sel_us    / 1000.0f,
+                    (t_draft_end_us - spec::g_dflash_prof.t_start_us) / 1000.0f);
+        }
         if (ret != 0) {
             LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
             return;
@@ -1994,106 +2970,44 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (i_block_beg[seq_id] < 0) {
                 continue;
             }
+            if (seq_id < (llama_seq_id) last_draft_ms.size()) {
+                last_draft_ms[seq_id] = total_d_ms;
+            }
             auto & dp = dparams[seq_id];
 
             const int32_t beg            = i_block_beg[seq_id];
             const int32_t n_block_tokens = n_block[seq_id];
 
-            auto * smpl = smpls[seq_id].get();
-
             auto & result = *dp.result;
 
-            if (is_dflash2) {
-                const float * lattice = llama_get_embeddings_nextn(ctx_dft);
-                GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
+            read_block_result(seq_id, beg, n_block_tokens, result);
 
-                int32_t predecessor = 0;
-                for (int32_t i = 1; i < n_block_tokens; ++i) {
-                    const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
-                    const float * scores = row + selector_top_k + (size_t) predecessor * selector_top_k;
-
-                    predecessor = (int32_t) std::distance(scores,
-                            std::max_element(scores, scores + selector_top_k));
-                    if (params.p_min > 0.0f) {
-                        // softmax(scores) at the argmax, i.e. 1 / sum(exp(s_k - s_max))
-                        float sum = 0.0f;
-                        for (int32_t k = 0; k < selector_top_k; ++k) {
-                            sum += std::exp(scores[k] - scores[predecessor]);
-                        }
-                        if (1.0f / sum < params.p_min) {
-                            break;
-                        }
-                    }
-                    result.push_back((llama_token) row[predecessor]);
+            // strip the lookahead row: it is the anchor guess for the next cycle and is never part of the verified draft
+            if (la_requested[seq_id]) {
+                if (result.size() == (size_t) k_eff_seq[seq_id] + 1) {
+                    la_token = result.back();
+                    la_k     = k_eff_seq[seq_id];
+                    la_valid = true;
+                    result.pop_back();
                 }
-
                 if (result.size() < (size_t) params.n_min) {
                     result.clear();
-                }
-                continue;
-            }
-
-            if (is_dspark) {
-                // DSpark: read from the first draft slot, truncate below the confidence threshold
-                const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
-                // bonus-anchor drafts read the mask positions only, like DFlash
-                const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;
-                for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
-                    const int32_t idx = beg + i;
-
-                    if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
-                        break;
-                    }
-
-                    common_sampler_sample(smpl, ctx_dft, idx, true);
-
-                    const auto * cur_p = common_sampler_get_candidates(smpl, true);
-
-                    for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
-                        LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
-                                seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
-                                common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
-                    }
-
-                    const llama_token id = cur_p->data[0].id;
-
-                    common_sampler_accept(smpl, id, true);
-
-                    result.push_back(id);
-                }
-            } else {
-                // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1
-                for (int32_t i = 1; i < n_block_tokens; ++i) {
-                    common_sampler_sample(smpl, ctx_dft, beg + i, true);
-
-                    const auto * cur_p = common_sampler_get_candidates(smpl, true);
-
-                    for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
-                        LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
-                                seq_id, k, i - 1, cur_p->data[k].id, cur_p->data[k].p,
-                                common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
-                    }
-
-                    const llama_token id = cur_p->data[0].id;
-
-                    if (cur_p->data[0].p < params.p_min) {
-                        break;
-                    }
-
-                    common_sampler_accept(smpl, id, true);
-
-                    result.push_back(id);
+                    la_valid = false;
                 }
             }
 
-            if (result.size() < (size_t) params.n_min) {
-                result.clear();
+            if (!is_dflash2 && seq_id < (llama_seq_id) last_k_drafted.size()) {
+                last_k_drafted[seq_id] = (int32_t) result.size();
             }
         }
     }
 
-    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
-        // noop
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+        if (!is_other && seq_id >= 0 && seq_id < (llama_seq_id) arbiters.size()) {
+            float d_ms = seq_id < (llama_seq_id) last_draft_ms.size() ? last_draft_ms[seq_id] : 0.0f;
+            arbiters[seq_id].observe(last_k_drafted[seq_id], n_accepted, d_ms);
+            accept_count[seq_id]++;
+        }
     }
 };
 
@@ -3245,6 +4159,14 @@ common_speculative_init_result::common_speculative_init_result(
             }
         }
 
+        const char * env_prof = std::getenv("LLAMA_DFLASH_PROFILE");
+        if (env_prof && std::atoi(env_prof) != 0) {
+            spec::g_dflash_prof.active = true;
+            cparams.cb_eval = spec::dflash_breakdown_profiler::cb;
+            cparams.cb_eval_user_data = &spec::g_dflash_prof;
+            LOG_INF("%s: DFlash node breakdown profiler enabled\n", __func__);
+        }
+
         llama_context * ctx_dft = llama_init_from_model(model_dft, cparams);
         if (ctx_dft == nullptr) {
             LOG_ERR("%s: failed to create MTP context\n", __func__);
@@ -3693,4 +4615,81 @@ bool common_speculative_dspark_stage_ctx_test(common_speculative * spec,
         staged |= impl->stage_test_ctx_feat(seq_id, feat, n_rows, n_embd_cap, pos);
     }
     return staged;
+}
+// ---------------------------------------------------------------------------------------------------------------
+// Stage S8: DFlash worker pipeline entry points (declared in speculative-tap.h)
+// ---------------------------------------------------------------------------------------------------------------
+static common_speculative_impl_draft_dflash * common_speculative_find_dflash(common_speculative * spec) {
+    if (spec == nullptr) {
+        return nullptr;
+    }
+    for (auto & impl : spec->impls) {
+        if (auto * d = dynamic_cast<common_speculative_impl_draft_dflash *>(impl.get())) {
+            return d;
+        }
+    }
+    return nullptr;
+}
+
+static const common_speculative_impl_draft_dflash * common_speculative_find_dflash(const common_speculative * spec) {
+    return common_speculative_find_dflash(const_cast<common_speculative *>(spec));
+}
+
+bool common_speculative_pipeline_attach(common_speculative * spec, spec::layer_tap * tap) {
+    auto * d = common_speculative_find_dflash(spec);
+    return d != nullptr && d->pipe_attach(tap);
+}
+
+bool common_speculative_pipeline_arm(common_speculative * spec, llama_seq_id seq_id, llama_pos pos0, int32_t n_real, int32_t k_exec) {
+    auto * d = common_speculative_find_dflash(spec);
+    return d != nullptr && d->pipe_arm(seq_id, pos0, n_real, k_exec);
+}
+
+void common_speculative_pipeline_disarm(common_speculative * spec, int64_t t_decode_end_us) {
+    if (auto * d = common_speculative_find_dflash(spec)) {
+        d->pipe_disarm(t_decode_end_us);
+    }
+}
+
+void common_speculative_pipeline_collect(common_speculative * spec, llama_seq_id seq_id, int n_accepted, llama_token id_last_actual) {
+    if (auto * d = common_speculative_find_dflash(spec)) {
+        d->pipe_collect(seq_id, n_accepted, id_last_actual);
+    }
+}
+
+bool common_speculative_pipeline_take(common_speculative * spec, llama_seq_id seq_id, int n_draft_max, llama_tokens & draft) {
+    auto * d = common_speculative_find_dflash(spec);
+    if (d == nullptr) {
+        return false;
+    }
+    {
+        common_time_meas tm(d->t_draft_us, !d->gen_perf);
+        if (!d->pipe_take(seq_id, n_draft_max, draft)) {
+            return false;
+        }
+    }
+    // same per-draft accounting common_speculative_draft() does for a sequential draft
+    d->n_call_draft++;
+    d->n_gen_drafts++;
+    d->n_gen_tokens += draft.size();
+    spec->impl_last[seq_id] = d;
+    return true;
+}
+
+void common_speculative_pipeline_abort(common_speculative * spec) {
+    if (auto * d = common_speculative_find_dflash(spec)) {
+        d->pipe_abort();
+    }
+}
+
+::spec::pipe_stats common_speculative_pipeline_get_stats(const common_speculative * spec) {
+    const auto * d = common_speculative_find_dflash(spec);
+    if (d == nullptr) {
+        return ::spec::pipe_stats{};
+    }
+    ::spec::pipe_stats s = d->pstats;
+    if (d->tap != nullptr) {
+        s.t_tap_cb_us = d->tap->stats().t_cb_us;
+    }
+    return s;
 }

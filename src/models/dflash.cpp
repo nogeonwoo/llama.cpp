@@ -706,18 +706,15 @@ static ggml_tensor * build_dflash2_conv(
     ggml_tensor * weight_all = ggml_add(ctx0, coeff_all, base_side);
 
     ggml_tensor * result = nullptr;
-    for (int64_t tap = 0; tap < kernel_size; ++tap) {
+    const int64_t max_tap = std::min(kernel_size, block_size);
+    for (int64_t tap = 0; tap < max_tap; ++tap) {
         ggml_tensor * values = blocks;
         if (tap > 0) {
             ggml_tensor * zeros = ggml_fill(ctx0,
-                    ggml_new_tensor_3d(ctx0, hidden->type, hidden_size, std::min(tap, block_size), n_blocks), 0.0f);
-            if (tap < block_size) {
-                ggml_tensor * previous = ggml_view_3d(ctx0, blocks, hidden_size, block_size - tap, n_blocks,
-                        blocks->nb[1], blocks->nb[2], 0);
-                values = ggml_concat(ctx0, zeros, previous, 1);
-            } else {
-                values = zeros;
-            }
+                    ggml_new_tensor_3d(ctx0, hidden->type, hidden_size, tap, n_blocks), 0.0f);
+            ggml_tensor * previous = ggml_view_3d(ctx0, blocks, hidden_size, block_size - tap, n_blocks,
+                    blocks->nb[1], blocks->nb[2], 0);
+            values = ggml_concat(ctx0, zeros, previous, 1);
         }
         values = ggml_reshape_2d(ctx0, values, hidden_size, n_tokens);
 
@@ -746,7 +743,8 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
     const int64_t rank     = hparams.dflash_selector_rank;
     const int64_t n_blocks = g.ubatch.n_seqs_unq;
     GGML_ASSERT(n_blocks > 0 && n_tokens % n_blocks == 0);
-    GGML_ASSERT(res->t_logits->ne[1] == n_tokens);
+    const bool prune_row0 = (n_tokens > 1 && n_blocks == 1 && res->t_logits->ne[1] == n_tokens - 1);
+    GGML_ASSERT(res->t_logits->ne[1] == (prune_row0 ? n_tokens - 1 : n_tokens));
     if (!tokens) {
         return;
     }
@@ -755,10 +753,24 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
     const int64_t block_size = std::min<int64_t>(tokens_per_block, hparams.dflash_block_size);
     const int64_t row_used   = top_k + top_k * top_k;
 
-    ggml_tensor * candidates  = ggml_top_k(ctx0, res->t_logits, top_k);
-    ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, res->t_logits, 1, res->t_logits->ne[0], n_tokens);
-    ggml_tensor * unary       = ggml_reshape_2d(ctx0,
-            ggml_get_rows(ctx0, logits_rows, candidates), top_k, n_tokens);
+    const int64_t n_logit_tokens = res->t_logits->ne[1];
+    ggml_tensor * candidates_raw = ggml_top_k(ctx0, res->t_logits, top_k);
+    ggml_tensor * logits_rows    = ggml_reshape_3d(ctx0, res->t_logits, 1, res->t_logits->ne[0], n_logit_tokens);
+    ggml_tensor * unary_raw      = ggml_reshape_2d(ctx0,
+            ggml_get_rows(ctx0, logits_rows, candidates_raw), top_k, n_logit_tokens);
+
+    ggml_tensor * candidates = candidates_raw;
+    ggml_tensor * unary      = unary_raw;
+
+    if (prune_row0) {
+        ggml_tensor * dummy_c = ggml_cast(ctx0,
+                ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, top_k, 1), 0.0f),
+                GGML_TYPE_I32);
+        ggml_tensor * dummy_u = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, top_k, 1), 0.0f);
+        candidates = ggml_concat(ctx0, dummy_c, candidates_raw, 1);
+        unary      = ggml_concat(ctx0, dummy_u, unary_raw, 1);
+    }
+
     ggml_tensor * gate        = g.build_lora_mm(model.dflash_selector_hidden, res->t_embd);
 
     // Everything below indexes [.., tokens_per_block, n_blocks]: the block
@@ -1107,6 +1119,23 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         GGML_ASSERT(model_other->output != nullptr && "DFlash decoder requires the target model's output projection");
         output   = model_other->output;
         output_s = model_other->output_s;
+    }
+
+    const char * env_prune = getenv("LLAMA_DFLASH_PRUNE_ROW0");
+    // Prune Row 0 when beneficial:
+    // - For n_tokens = 2 (K=1): cuts LM head 2 -> 1 token (saving ~1.8 ms)
+    // - For n_tokens = 3 (K=2): cuts LM head 3 -> 2 tokens (eliminating 3-wide SIMD penalty, saving ~6.6 ms)
+    // - For n_tokens = 4 (K=3): keeping 4 tokens allows 4-wide SIMD GEMV (9.6 ms vs 12.4 ms for 3)
+    // User can force via LLAMA_DFLASH_PRUNE_ROW0=1 or disable via LLAMA_DFLASH_PRUNE_ROW0=0.
+    const bool prune_optimal = (n_tokens == 2 || n_tokens == 3 || ((n_tokens - 1) % 4 == 0));
+    const bool prune_row0 = (model.dflash_selector_hidden != nullptr &&
+                             n_tokens > 1 &&
+                             ubatch.n_seqs_unq == 1 &&
+                             (env_prune ? (std::atoi(env_prune) != 0) : prune_optimal));
+
+    if (prune_row0) {
+        const int64_t n_mask_tokens = n_tokens - 1;
+        cur = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, n_embd, n_mask_tokens, cur->nb[1], 1 * cur->nb[1]));
     }
 
     cur = build_lora_mm(output, cur, output_s);
