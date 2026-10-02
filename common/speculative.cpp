@@ -1664,6 +1664,10 @@ struct dflash_breakdown_profiler {
     static constexpr int MAX_PROF_LAYERS = 8;
     int64_t t_layer_start_us   [MAX_PROF_LAYERS] = {0};
     int64_t dur_attn_us        [MAX_PROF_LAYERS] = {0};
+    int64_t dur_ffn_up_us      [MAX_PROF_LAYERS] = {0};
+    int64_t dur_ffn_gate_us    [MAX_PROF_LAYERS] = {0};
+    int64_t dur_ffn_swiglu_us  [MAX_PROF_LAYERS] = {0};
+    int64_t dur_ffn_down_us    [MAX_PROF_LAYERS] = {0};
     int64_t dur_ffn_us         [MAX_PROF_LAYERS] = {0};
     int64_t dur_layer_us       [MAX_PROF_LAYERS] = {0};
     int64_t last_checkpoint_us = 0;
@@ -1678,10 +1682,14 @@ struct dflash_breakdown_profiler {
         last_n_tokens = n_tokens;
         last_checkpoint_us = t_start_us;
         for (int i = 0; i < MAX_PROF_LAYERS; ++i) {
-            t_layer_start_us[i] = (i == 0) ? t_start_us : 0;
-            dur_attn_us[i]      = 0;
-            dur_ffn_us[i]       = 0;
-            dur_layer_us[i]     = 0;
+            t_layer_start_us[i]   = (i == 0) ? t_start_us : 0;
+            dur_attn_us[i]        = 0;
+            dur_ffn_up_us[i]      = 0;
+            dur_ffn_gate_us[i]    = 0;
+            dur_ffn_swiglu_us[i]  = 0;
+            dur_ffn_down_us[i]    = 0;
+            dur_ffn_us[i]         = 0;
+            dur_layer_us[i]       = 0;
         }
     }
 
@@ -1695,7 +1703,10 @@ struct dflash_breakdown_profiler {
             if (std::strcmp(t->name, "result_output") == 0) return true;
             if (p->deep_profile) {
                 if (std::strncmp(t->name, "attn_conv_out-", 14) == 0) return true;
-                if (std::strncmp(t->name, "ffn_out-", 8) == 0 && std::strstr(t->name, "(") == nullptr) return true;
+                if (std::strncmp(t->name, "ffn_up-", 7) == 0     && std::strstr(t->name, "(") == nullptr) return true;
+                if (std::strncmp(t->name, "ffn_gate-", 9) == 0   && std::strstr(t->name, "(") == nullptr) return true;
+                if (std::strncmp(t->name, "ffn_swiglu-", 11) == 0 && std::strstr(t->name, "(") == nullptr) return true;
+                if (std::strncmp(t->name, "ffn_out-", 8) == 0    && std::strstr(t->name, "(") == nullptr) return true;
                 if (std::strncmp(t->name, "l_out-", 6) == 0)          return true;
             }
             return false;
@@ -1722,10 +1733,29 @@ struct dflash_breakdown_profiler {
                     p->dur_attn_us[il] = now - p->last_checkpoint_us;
                     p->last_checkpoint_us = now;
                 }
+            } else if (std::strncmp(t->name, "ffn_up-", 7) == 0 && std::strstr(t->name, "(") == nullptr) {
+                int il = std::atoi(t->name + 7);
+                if (il >= 0 && il < MAX_PROF_LAYERS) {
+                    p->dur_ffn_up_us[il] = now - p->last_checkpoint_us;
+                    p->last_checkpoint_us = now;
+                }
+            } else if (std::strncmp(t->name, "ffn_gate-", 9) == 0 && std::strstr(t->name, "(") == nullptr) {
+                int il = std::atoi(t->name + 9);
+                if (il >= 0 && il < MAX_PROF_LAYERS) {
+                    p->dur_ffn_gate_us[il] = now - p->last_checkpoint_us;
+                    p->last_checkpoint_us = now;
+                }
+            } else if (std::strncmp(t->name, "ffn_swiglu-", 11) == 0 && std::strstr(t->name, "(") == nullptr) {
+                int il = std::atoi(t->name + 11);
+                if (il >= 0 && il < MAX_PROF_LAYERS) {
+                    p->dur_ffn_swiglu_us[il] = now - p->last_checkpoint_us;
+                    p->last_checkpoint_us = now;
+                }
             } else if (std::strncmp(t->name, "ffn_out-", 8) == 0 && std::strstr(t->name, "(") == nullptr) {
                 int il = std::atoi(t->name + 8);
                 if (il >= 0 && il < MAX_PROF_LAYERS) {
-                    p->dur_ffn_us[il] = now - p->last_checkpoint_us;
+                    p->dur_ffn_down_us[il] = now - p->last_checkpoint_us;
+                    p->dur_ffn_us[il] = p->dur_ffn_up_us[il] + p->dur_ffn_gate_us[il] + p->dur_ffn_swiglu_us[il] + p->dur_ffn_down_us[il];
                     p->last_checkpoint_us = now;
                 }
             } else if (std::strncmp(t->name, "l_out-", 6) == 0) {
@@ -3022,19 +3052,34 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     (t_draft_end_us - spec::g_dflash_prof.t_start_us) / 1000.0f);
             if (spec::g_dflash_prof.deep_profile) {
                 int64_t tot_attn_us = 0, tot_ffn_us = 0;
+                int64_t tot_up_us = 0, tot_gate_us = 0, tot_swiglu_us = 0, tot_down_us = 0;
                 for (int il = 0; il < 5; ++il) {
-                    tot_attn_us += spec::g_dflash_prof.dur_attn_us[il];
-                    tot_ffn_us  += spec::g_dflash_prof.dur_ffn_us[il];
-                    LOG_INF("[dflash-layer-%d] Attn(+QKV)=%5.2f ms | FFN=%5.2f ms | LayerTotal=%5.2f ms\n",
+                    tot_attn_us   += spec::g_dflash_prof.dur_attn_us[il];
+                    tot_ffn_us    += spec::g_dflash_prof.dur_ffn_us[il];
+                    tot_up_us     += spec::g_dflash_prof.dur_ffn_up_us[il];
+                    tot_gate_us   += spec::g_dflash_prof.dur_ffn_gate_us[il];
+                    tot_swiglu_us += spec::g_dflash_prof.dur_ffn_swiglu_us[il];
+                    tot_down_us   += spec::g_dflash_prof.dur_ffn_down_us[il];
+                    LOG_INF("[dflash-layer-%d] Attn(+QKV)=%5.2f ms | FFN=%5.2f ms [Up=%4.2f Gate=%4.2f SwiGLU=%4.2f Down=%4.2f] | LayerTotal=%5.2f ms\n",
                             il,
-                            spec::g_dflash_prof.dur_attn_us[il]  / 1000.0f,
-                            spec::g_dflash_prof.dur_ffn_us[il]   / 1000.0f,
-                            spec::g_dflash_prof.dur_layer_us[il] / 1000.0f);
+                            spec::g_dflash_prof.dur_attn_us[il]       / 1000.0f,
+                            spec::g_dflash_prof.dur_ffn_us[il]        / 1000.0f,
+                            spec::g_dflash_prof.dur_ffn_up_us[il]     / 1000.0f,
+                            spec::g_dflash_prof.dur_ffn_gate_us[il]   / 1000.0f,
+                            spec::g_dflash_prof.dur_ffn_swiglu_us[il] / 1000.0f,
+                            spec::g_dflash_prof.dur_ffn_down_us[il]   / 1000.0f,
+                            spec::g_dflash_prof.dur_layer_us[il]      / 1000.0f);
                 }
                 LOG_INF("[dflash-deep-summary] 5-Layer Sum: Attn(+QKV)=%5.2f ms | FFN=%5.2f ms | Conv/Residual/Other=%5.2f ms\n",
                         tot_attn_us / 1000.0f,
                         tot_ffn_us  / 1000.0f,
                         (spec::g_dflash_prof.dur_layers_us - tot_attn_us - tot_ffn_us) / 1000.0f);
+                LOG_INF("[dflash-ffn-projections] 5-Layer FFN Decomposition: Up=%5.2f ms | Gate=%5.2f ms | SwiGLU(act)=%5.2f ms | Down=%5.2f ms (Total FFN=%5.2f ms)\n",
+                        tot_up_us     / 1000.0f,
+                        tot_gate_us   / 1000.0f,
+                        tot_swiglu_us / 1000.0f,
+                        tot_down_us   / 1000.0f,
+                        tot_ffn_us    / 1000.0f);
             }
         }
         if (ret != 0) {
