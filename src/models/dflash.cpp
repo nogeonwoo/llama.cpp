@@ -1,6 +1,9 @@
 #include "models.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <vector>
 
 #include "llama-impl.h"
 #include "llama-kv-cache.h"
@@ -664,7 +667,7 @@ static void build_dfly_correction_head(llm_graph_context & g, const llama_model 
     ggml_build_forward_expand(g.gf, out);
 }
 
-static ggml_tensor * build_dflash2_conv(
+static ggml_tensor * build_dflash2_conv_ref(
         llm_graph_context & g,
         ggml_tensor * hidden,
         ggml_tensor * dynamic,
@@ -724,6 +727,100 @@ static ggml_tensor * build_dflash2_conv(
                 hidden_size, n_tokens);
 
         ggml_tensor * term = ggml_mul(ctx0, weight, values);
+        result = result ? ggml_add(ctx0, result, term) : term;
+    }
+    return result;
+}
+
+// DFlash2 dynamic depthwise conv, dispatch-lean form (bit-identical to build_dflash2_conv_ref):
+//   * tap-major weight layout [group_size, n_groups, n_tokens, n_taps], so each tap's weight slice is a
+//     contiguous 2-D view and the per-tap ggml_cont of the reference path disappears
+//   * coefficients are repeated straight from a strided view (no ggml_cont) and only the n_taps that
+//     can be non-zero are materialised, not all kernel_size of them
+//   * the causal shift is one zero-padded tensor plus per-tap offset views, instead of a
+//     ggml_fill + ggml_concat pair per tap
+//   * the tap products are expanded into the graph before the accumulation chain so independent
+//     products sit next to each other in the node list
+// Summation order is the same left fold as the reference, so results match bit for bit.
+// LLAMA_DFLASH_CONV_REF=1 selects the reference path for A/B timing and bit-exact checks.
+static ggml_tensor * build_dflash2_conv(
+        llm_graph_context & g,
+        ggml_tensor * hidden,
+        ggml_tensor * dynamic,
+        ggml_tensor * base,
+        int side) {
+    static const bool use_ref = std::getenv("LLAMA_DFLASH_CONV_REF") != nullptr;
+    if (use_ref) {
+        return build_dflash2_conv_ref(g, hidden, dynamic, base, side);
+    }
+
+    const auto & hparams = g.hparams;
+    const int64_t hidden_size = hidden->ne[0];
+    const int64_t n_tokens    = hidden->ne[1];
+    const int64_t n_blocks    = g.ubatch.n_seqs_unq;
+    const int64_t kernel_size = hparams.dflash_conv_kernel_size;
+    const int64_t group_size  = hparams.dflash_conv_group_size;
+    const int64_t n_groups    = hidden_size / group_size;
+
+    GGML_ASSERT(n_blocks > 0 && n_tokens % n_blocks == 0);
+    GGML_ASSERT(dynamic && base && side >= 0 && side < 2);
+
+    const int64_t block_size = n_tokens / n_blocks;
+    const int64_t n_taps     = std::min(kernel_size, block_size);
+    ggml_context * ctx0 = g.ctx0;
+
+    if (!ggml_is_contiguous(hidden)) {
+        hidden = ggml_cont_2d(ctx0, hidden, hidden_size, n_tokens);
+    }
+    if (!ggml_is_contiguous(dynamic)) {
+        dynamic = ggml_cont_2d(ctx0, dynamic, dynamic->ne[0], n_tokens);
+    }
+
+    // per-token coefficients [n_groups, kernel_size, 2, n_tokens] -> this side's first n_taps taps, viewed
+    // as [1, n_groups, n_tokens, n_taps] and repeated across the channels of each group
+    ggml_tensor * coeffs = ggml_reshape_4d(ctx0, dynamic, n_groups, kernel_size, 2, n_tokens);
+    ggml_tensor * coeff_side = ggml_view_4d(ctx0, coeffs, 1, n_groups, n_tokens, n_taps,
+            coeffs->nb[0], coeffs->nb[3], coeffs->nb[1], (size_t) side * coeffs->nb[2]);
+    ggml_tensor * coeff_full = ggml_repeat_4d(ctx0, coeff_side, group_size, n_groups, n_tokens, n_taps);
+
+    // static per-channel base [hidden_size, kernel_size, 2] -> [group_size, n_groups, 1, n_taps],
+    // broadcast over tokens by the add
+    ggml_tensor * base_side = ggml_view_4d(ctx0, base, group_size, n_groups, 1, n_taps,
+            group_size * base->nb[0], base->nb[1], base->nb[1], (size_t) side * base->nb[2]);
+
+    ggml_tensor * weight_all = ggml_add(ctx0, coeff_full, base_side);
+
+    // causal shift inside each block: left-pad every block with n_taps-1 zero rows once, then tap t reads
+    // the padded tensor shifted by (n_taps-1-t) rows
+    ggml_tensor * blocks = ggml_reshape_3d(ctx0, hidden, hidden_size, block_size, n_blocks);
+    ggml_tensor * padded = blocks;
+    if (n_taps > 1) {
+        ggml_tensor * zeros = ggml_fill(ctx0,
+                ggml_new_tensor_3d(ctx0, hidden->type, hidden_size, n_taps - 1, n_blocks), 0.0f);
+        padded = ggml_concat(ctx0, zeros, blocks, 1);
+    }
+
+    ggml_tensor * result = nullptr;
+    std::vector<ggml_tensor *> terms;
+    terms.reserve((size_t) n_taps);
+    for (int64_t tap = 0; tap < n_taps; ++tap) {
+        ggml_tensor * values = ggml_view_3d(ctx0, padded, hidden_size, block_size, n_blocks,
+                padded->nb[1], padded->nb[2], (size_t) (n_taps - 1 - tap) * padded->nb[1]);
+        // with several blocks the padded rows interleave the blocks, so the shifted view is not contiguous
+        if (n_blocks > 1 && n_taps > 1) {
+            values = ggml_cont(ctx0, values);
+        }
+        values = ggml_reshape_2d(ctx0, values, hidden_size, n_tokens);
+
+        ggml_tensor * weight = ggml_view_2d(ctx0, weight_all, hidden_size, n_tokens,
+                weight_all->nb[2], (size_t) tap * weight_all->nb[3]);
+
+        ggml_tensor * term = ggml_mul(ctx0, weight, values);
+        ggml_build_forward_expand(g.gf, term);
+        terms.push_back(term);
+    }
+
+    for (ggml_tensor * term : terms) {
         result = result ? ggml_add(ctx0, result, term) : term;
     }
     return result;
