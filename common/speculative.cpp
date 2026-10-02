@@ -1658,6 +1658,32 @@ struct dflash_breakdown_profiler {
     int64_t dur_sel_us    = 0;
     int32_t last_n_tokens = 0;
     bool    active        = false;
+    bool    deep_profile  = false;
+
+    // Sub-layer profiling for up to 8 layers
+    static constexpr int MAX_PROF_LAYERS = 8;
+    int64_t t_layer_start_us   [MAX_PROF_LAYERS] = {0};
+    int64_t dur_attn_us        [MAX_PROF_LAYERS] = {0};
+    int64_t dur_ffn_us         [MAX_PROF_LAYERS] = {0};
+    int64_t dur_layer_us       [MAX_PROF_LAYERS] = {0};
+    int64_t last_checkpoint_us = 0;
+
+    void reset(int32_t n_tokens) {
+        t_start_us    = ggml_time_us();
+        t_norm_us     = 0;
+        t_output_us   = 0;
+        dur_layers_us = 0;
+        dur_head_us   = 0;
+        dur_sel_us    = 0;
+        last_n_tokens = n_tokens;
+        last_checkpoint_us = t_start_us;
+        for (int i = 0; i < MAX_PROF_LAYERS; ++i) {
+            t_layer_start_us[i] = (i == 0) ? t_start_us : 0;
+            dur_attn_us[i]      = 0;
+            dur_ffn_us[i]       = 0;
+            dur_layer_us[i]     = 0;
+        }
+    }
 
     static bool cb(struct ggml_tensor * t, bool ask, void * user_data) {
         auto * p = static_cast<dflash_breakdown_profiler *>(user_data);
@@ -1667,15 +1693,52 @@ struct dflash_breakdown_profiler {
         if (ask) {
             if (std::strcmp(t->name, "result_norm") == 0)   return true;
             if (std::strcmp(t->name, "result_output") == 0) return true;
+            if (p->deep_profile) {
+                if (std::strncmp(t->name, "attn_conv_out-", 14) == 0) return true;
+                if (std::strncmp(t->name, "ffn_out-", 8) == 0 && std::strstr(t->name, "(") == nullptr) return true;
+                if (std::strncmp(t->name, "l_out-", 6) == 0)          return true;
+            }
             return false;
         }
         const int64_t now = ggml_time_us();
+        if (p->deep_profile) {
+            // Only trace primary checkpoint nodes
+            if (std::strstr(t->name, "(") == nullptr) {
+                LOG_INF("[cb-trace] %-20s : +%6.2f ms (since last cp)\n", t->name, (now - p->last_checkpoint_us) / 1000.0f);
+            }
+        }
         if (std::strcmp(t->name, "result_norm") == 0) {
             p->t_norm_us     = now;
             p->dur_layers_us = now - p->t_start_us;
+            p->last_checkpoint_us = now;
         } else if (std::strcmp(t->name, "result_output") == 0) {
             p->t_output_us = now;
             p->dur_head_us = now - p->t_norm_us;
+            p->last_checkpoint_us = now;
+        } else if (p->deep_profile) {
+            if (std::strncmp(t->name, "attn_conv_out-", 14) == 0) {
+                int il = std::atoi(t->name + 14);
+                if (il >= 0 && il < MAX_PROF_LAYERS) {
+                    p->dur_attn_us[il] = now - p->last_checkpoint_us;
+                    p->last_checkpoint_us = now;
+                }
+            } else if (std::strncmp(t->name, "ffn_out-", 8) == 0 && std::strstr(t->name, "(") == nullptr) {
+                int il = std::atoi(t->name + 8);
+                if (il >= 0 && il < MAX_PROF_LAYERS) {
+                    p->dur_ffn_us[il] = now - p->last_checkpoint_us;
+                    p->last_checkpoint_us = now;
+                }
+            } else if (std::strncmp(t->name, "l_out-", 6) == 0) {
+                int il = std::atoi(t->name + 6);
+                if (il >= 0 && il < MAX_PROF_LAYERS) {
+                    int64_t l_start = (il == 0) ? p->t_start_us : p->t_layer_start_us[il];
+                    p->dur_layer_us[il] = now - l_start;
+                    if (il + 1 < MAX_PROF_LAYERS) {
+                        p->t_layer_start_us[il + 1] = now;
+                    }
+                    p->last_checkpoint_us = now;
+                }
+            }
         }
         return true;
     }
@@ -2933,10 +2996,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         // decode all sequence's noise block in a single batch
         if (spec::g_dflash_prof.active) {
-            spec::g_dflash_prof.t_start_us    = ggml_time_us();
-            spec::g_dflash_prof.t_norm_us     = 0;
-            spec::g_dflash_prof.t_output_us   = 0;
-            spec::g_dflash_prof.last_n_tokens = (int32_t) batch.n_tokens;
+            spec::g_dflash_prof.reset((int32_t) batch.n_tokens);
         }
         const int64_t t_draft_start_us = ggml_time_us();
         int ret = llama_decode(ctx_dft, batch);
@@ -2960,6 +3020,22 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     spec::g_dflash_prof.dur_head_us   / 1000.0f,
                     spec::g_dflash_prof.dur_sel_us    / 1000.0f,
                     (t_draft_end_us - spec::g_dflash_prof.t_start_us) / 1000.0f);
+            if (spec::g_dflash_prof.deep_profile) {
+                int64_t tot_attn_us = 0, tot_ffn_us = 0;
+                for (int il = 0; il < 5; ++il) {
+                    tot_attn_us += spec::g_dflash_prof.dur_attn_us[il];
+                    tot_ffn_us  += spec::g_dflash_prof.dur_ffn_us[il];
+                    LOG_INF("[dflash-layer-%d] Attn(+QKV)=%5.2f ms | FFN=%5.2f ms | LayerTotal=%5.2f ms\n",
+                            il,
+                            spec::g_dflash_prof.dur_attn_us[il]  / 1000.0f,
+                            spec::g_dflash_prof.dur_ffn_us[il]   / 1000.0f,
+                            spec::g_dflash_prof.dur_layer_us[il] / 1000.0f);
+                }
+                LOG_INF("[dflash-deep-summary] 5-Layer Sum: Attn(+QKV)=%5.2f ms | FFN=%5.2f ms | Conv/Residual/Other=%5.2f ms\n",
+                        tot_attn_us / 1000.0f,
+                        tot_ffn_us  / 1000.0f,
+                        (spec::g_dflash_prof.dur_layers_us - tot_attn_us - tot_ffn_us) / 1000.0f);
+            }
         }
         if (ret != 0) {
             LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
@@ -4162,9 +4238,15 @@ common_speculative_init_result::common_speculative_init_result(
         const char * env_prof = std::getenv("LLAMA_DFLASH_PROFILE");
         if (env_prof && std::atoi(env_prof) != 0) {
             spec::g_dflash_prof.active = true;
+            const char * env_deep = std::getenv("LLAMA_DFLASH_DEEP_PROFILE");
+            if (env_deep && std::atoi(env_deep) != 0) {
+                spec::g_dflash_prof.deep_profile = true;
+                LOG_INF("%s: DFlash DEEP node breakdown profiler enabled (sub-layer profiling)\n", __func__);
+            } else {
+                LOG_INF("%s: DFlash node breakdown profiler enabled\n", __func__);
+            }
             cparams.cb_eval = spec::dflash_breakdown_profiler::cb;
             cparams.cb_eval_user_data = &spec::g_dflash_prof;
-            LOG_INF("%s: DFlash node breakdown profiler enabled\n", __func__);
         }
 
         llama_context * ctx_dft = llama_init_from_model(model_dft, cparams);
