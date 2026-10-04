@@ -2,9 +2,14 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 
+#include "ggml-backend.h"
+#include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -934,6 +939,241 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
     ggml_build_forward_expand(g.gf, packed);
 }
 
+// =============================================================================================
+// Phase 6 / ADR 0018: fused Up-Gate projection for the DFlash decoder FFN.
+//
+// build_ffn() runs two GEMVs per layer on the same activation (up and gate, both n_embd -> n_ff).
+// With LLAMA_DFLASH_FUSED_FFN=1 the two weights are stacked once into a single [n_embd, 2*n_ff]
+// weight (gate rows first, the layout build_moe_ffn() uses for merged gate_up_exps), so each layer
+// issues one mul_mat instead of two; the result is split back into gate/up views and goes through
+// ggml_swiglu_split exactly like build_ffn(). Dispatches saved: n_layer per draft pass.
+//
+// The stacked copy is built lazily on the first graph build (the weights are resident by then) and
+// cached for the life of the process; it costs one extra gate+up copy per fused layer. Per-row
+// accumulation is untouched, so outputs are expected to match build_ffn() bit for bit.
+//
+// Layers the fused path cannot reproduce return nullptr and keep the unmodified build_ffn() path:
+// per-tensor gate/up scales, LoRA or Hadamard-folded gate/up, clamped SwiGLU, and gate/up that are
+// not identically typed, shaped and laid out.
+// =============================================================================================
+namespace {
+
+struct dflash_fused_gate_up {
+    ggml_context *        ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    ggml_tensor *         w   = nullptr; // nullptr: this layer was tried and cannot be fused, do not retry
+
+    // identity of the weights the stacked copy was built from; only ever compared, never dereferenced
+    const ggml_tensor * up_src      = nullptr;
+    const void *        gate_data   = nullptr;
+    const void *        up_data     = nullptr;
+    uint64_t            fingerprint = 0;
+};
+
+} // namespace
+
+// FNV-1a over three 4 KiB windows (head / middle / tail) of a weight. Cheap enough for every graph
+// build, and it tells a reloaded model apart from a stale cache entry that reuses the same addresses.
+static uint64_t dflash_fused_ffn_fingerprint(const ggml_tensor * t) {
+    const size_t nb  = ggml_nbytes(t);
+    const size_t win = std::min<size_t>(nb, 4096);
+
+    std::vector<uint8_t> tmp(win);
+    uint64_t h = 1469598103934665603ULL;
+
+    const size_t offs[3] = { 0, (nb - win) / 2, nb - win };
+    for (const size_t off : offs) {
+        ggml_backend_tensor_get(t, tmp.data(), off, win);
+        for (const uint8_t b : tmp) {
+            h = (h ^ b) * 1099511628211ULL;
+        }
+    }
+    return h;
+}
+
+// default buffer type of the device that holds `src`, so the stacked copy sits next to the weights it
+// duplicates (avoids allocating through an mmap-specific buffer type)
+static ggml_backend_buffer_type_t dflash_fused_ffn_buft(const ggml_tensor * src) {
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(src->buffer);
+    ggml_backend_dev_t         dev  = ggml_backend_buft_get_device(buft);
+    return dev ? ggml_backend_dev_buffer_type(dev) : buft;
+}
+
+static void dflash_fused_ffn_copy(const ggml_tensor * src, ggml_tensor * dst, size_t dst_offset) {
+    const size_t nb = ggml_nbytes(src);
+    if (ggml_backend_buffer_is_host(src->buffer)) {
+        ggml_backend_tensor_set(dst, src->data, dst_offset, nb);
+    } else {
+        std::vector<uint8_t> tmp(nb);
+        ggml_backend_tensor_get(src, tmp.data(), 0, nb);
+        ggml_backend_tensor_set(dst, tmp.data(), dst_offset, nb);
+    }
+}
+
+// Returns the stacked [n_embd, 2*n_ff] gate+up weight of layer il, building it on first use.
+// nullptr means "not fusable" (reason logged once) and the caller must use build_ffn().
+static ggml_tensor * dflash_fused_gate_up_weight(const llama_model & model, int il) {
+    const auto & layer = model.layers[il];
+
+    const ggml_tensor * gate = layer.ffn_gate;
+    const ggml_tensor * up   = layer.ffn_up;
+
+    if (gate == nullptr || up == nullptr ||
+        gate->buffer == nullptr || up->buffer == nullptr ||
+        gate->data   == nullptr || up->data   == nullptr) {
+        return nullptr;
+    }
+
+    // layout preconditions: the stacked tensor is a plain byte concatenation of the two weights
+    const char * why = nullptr;
+    if (gate->type != up->type) {
+        why = "gate/up quantization types differ";
+    } else if (!ggml_are_same_shape(gate, up) || gate->ne[2] != 1 || gate->ne[3] != 1) {
+        why = "gate/up are not identical 2-D matrices";
+    } else if (!ggml_is_contiguous(gate) || !ggml_is_contiguous(up)) {
+        why = "gate/up are not contiguous";
+    } else if (gate->extra != nullptr || up->extra != nullptr) {
+        why = "gate/up use a backend-private (repacked or split) layout";
+    }
+
+    static std::mutex mtx;
+    static auto & cache = *new std::unordered_map<const ggml_tensor *, dflash_fused_gate_up>(); // never destroyed on purpose
+    std::lock_guard<std::mutex> lock(mtx);
+
+    const uint64_t fp = why ? 0 : (dflash_fused_ffn_fingerprint(gate) * 1099511628211ULL) ^ dflash_fused_ffn_fingerprint(up);
+
+    const auto it = cache.find(gate);
+    if (it != cache.end()) {
+        const dflash_fused_gate_up & old = it->second;
+        if (old.up_src == up && old.gate_data == gate->data && old.up_data == up->data && old.fingerprint == fp) {
+            return old.w;
+        }
+        // same tensor address, different weights (model reloaded in this process): drop the stale copy
+        if (old.buf) { ggml_backend_buffer_free(old.buf); }
+        if (old.ctx) { ggml_free(old.ctx); }
+        cache.erase(it);
+    }
+
+    dflash_fused_gate_up e;
+    e.up_src      = up;
+    e.gate_data   = gate->data;
+    e.up_data     = up->data;
+    e.fingerprint = fp;
+
+    if (why) {
+        LLAMA_LOG_WARN("%s: layer %d: fused FFN disabled (%s), using build_ffn\n", __func__, il, why);
+    } else {
+        ggml_init_params ip = {
+            /*.mem_size   =*/ ggml_tensor_overhead() * 2,
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        e.ctx = ggml_init(ip);
+
+        if (e.ctx) {
+            ggml_tensor * w = ggml_new_tensor_2d(e.ctx, gate->type, gate->ne[0], 2*gate->ne[1]);
+            ggml_format_name(w, "blk.%d.ffn_gate_up.weight", il);
+
+            e.buf = ggml_backend_alloc_ctx_tensors_from_buft(e.ctx, dflash_fused_ffn_buft(gate));
+            if (e.buf) {
+                // lets the scheduler place the op with the weight, as for every other model weight
+                ggml_backend_buffer_set_usage(e.buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+                // rows [0, n_ff) = gate, rows [n_ff, 2*n_ff) = up
+                dflash_fused_ffn_copy(gate, w, 0);
+                dflash_fused_ffn_copy(up,   w, ggml_nbytes(gate));
+
+                e.w = w;
+                LLAMA_LOG_INFO("%s: layer %d: stacked gate+up %s [%lld x %lld] = %.1f MiB\n",
+                        __func__, il, ggml_type_name(gate->type),
+                        (long long) w->ne[0], (long long) w->ne[1], ggml_nbytes(w) / 1048576.0);
+            }
+        }
+
+        if (e.w == nullptr) {
+            if (e.ctx) {
+                ggml_free(e.ctx);
+                e.ctx = nullptr;
+            }
+            e.buf = nullptr;
+            LLAMA_LOG_WARN("%s: layer %d: could not allocate the stacked gate+up weight, using build_ffn\n", __func__, il);
+        }
+    }
+
+    cache.emplace(gate, e);
+    return e.w;
+}
+
+// Fused replacement for build_ffn(cur, up, NULL, up_s, gate, NULL, gate_s, down, NULL, down_s, NULL,
+// LLM_FFN_SILU, LLM_FFN_PAR, il). Returns nullptr when LLAMA_DFLASH_FUSED_FFN is not 1 or when this
+// layer cannot be fused; the caller then runs build_ffn() unchanged.
+static ggml_tensor * build_dflash_fused_ffn(llm_graph_context & g, const llama_model & model, ggml_tensor * cur, int il) {
+    // read once: the graph topology must not change between builds, or graph reuse would splice two shapes
+    static const bool enabled = [] {
+        const char * env = std::getenv("LLAMA_DFLASH_FUSED_FFN");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    if (!enabled) {
+        return nullptr;
+    }
+
+    const auto & layer = model.layers[il];
+
+    ggml_tensor * gate = layer.ffn_gate;
+    ggml_tensor * up   = layer.ffn_up;
+    ggml_tensor * down = layer.ffn_down;
+    if (!gate || !up || !down) {
+        return nullptr;
+    }
+
+    // build_ffn semantics the fused path does not reproduce
+    if (layer.ffn_gate_s || layer.ffn_up_s) {
+        return nullptr; // per-branch scales
+    }
+    if (g.hparams.swiglu_clamp_shexp[il] > 1e-6f) {
+        return nullptr; // clamped SwiGLU variant
+    }
+    if (g.hadamard_rotations &&
+            (g.hadamard_rotations->find(gate) != g.hadamard_rotations->end() ||
+             g.hadamard_rotations->find(up)   != g.hadamard_rotations->end())) {
+        return nullptr; // folded weights are keyed by tensor pointer; the stacked weight would lose the rotation
+    }
+    if (g.loras) {
+        for (const auto & lora : *g.loras) {
+            if (lora.first->get_weight(gate) != nullptr || lora.first->get_weight(up) != nullptr) {
+                return nullptr; // adapters are keyed by tensor pointer as well
+            }
+        }
+    }
+
+    ggml_tensor * w = dflash_fused_gate_up_weight(model, il);
+    if (!w) {
+        return nullptr;
+    }
+
+    ggml_context * ctx0 = g.ctx0;
+
+    // one GEMV over [gate; up] instead of two
+    ggml_tensor * gate_up = g.build_lora_mm(w, cur); // [2*n_ff, n_tokens]
+    g.cb(gate_up, "ffn_gate_up", il);
+
+    const int64_t n_ff = gate_up->ne[0] / 2;
+
+    ggml_tensor * gate_v = ggml_view_2d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->nb[1], 0);
+    ggml_tensor * up_v   = ggml_view_2d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->nb[1], (size_t) n_ff * gate_up->nb[0]);
+
+    ggml_tensor * act = ggml_swiglu_split(ctx0, gate_v, up_v); // silu(gate) * up
+    g.cb(act, "ffn_swiglu", il);
+
+    ggml_tensor * out = g.build_lora_mm(down, act);
+    if (layer.ffn_down_s) {
+        out = ggml_mul(ctx0, out, layer.ffn_down_s);
+        g.cb(out, "ffn_down_s", il);
+    }
+
+    return out;
+}
+
 // DFlash decoder, dual-mode by batch type:
 //   * embd batch  -> fused target features: project + inject K/V into the cache.
 //   * token batch -> noise-block diffusion: attend over [committed, MASK...] to generate draft tokens
@@ -1183,12 +1423,20 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
             cb(cur, "ffn_conv_in", il);
         }
 
-        cur = build_ffn(cur,
-                layer.ffn_up,   NULL, layer.ffn_up_s,
-                layer.ffn_gate, NULL, layer.ffn_gate_s,
-                layer.ffn_down, NULL, layer.ffn_down_s,
-                NULL,
-                LLM_FFN_SILU, LLM_FFN_PAR, il);
+        // LLAMA_DFLASH_FUSED_FFN=1: one [gate; up] GEMV + split + ggml_swiglu_split per layer. The helper
+        // returns nullptr when the flag is 0/unset or the layer is not eligible (per-tensor scales, LoRA,
+        // Hadamard-folded or mismatched gate/up); then the unmodified build_ffn path below is taken.
+        ggml_tensor * ffn_fused = build_dflash_fused_ffn(*this, model, cur, il);
+        if (ffn_fused) {
+            cur = ffn_fused;
+        } else {
+            cur = build_ffn(cur,
+                    layer.ffn_up,   NULL, layer.ffn_up_s,
+                    layer.ffn_gate, NULL, layer.ffn_gate_s,
+                    layer.ffn_down, NULL, layer.ffn_down_s,
+                    NULL,
+                    LLM_FFN_SILU, LLM_FFN_PAR, il);
+        }
         cb(cur, "ffn_out", il);
 
         if (ffn_dynamic) {
