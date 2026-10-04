@@ -970,6 +970,24 @@ struct dflash_fused_gate_up {
     uint64_t            fingerprint = 0;
 };
 
+static std::mutex g_fused_ffn_mtx;
+static std::unordered_map<const ggml_tensor *, dflash_fused_gate_up> g_fused_ffn_cache;
+
+static void dflash_fused_gate_up_cleanup() {
+    std::lock_guard<std::mutex> lock(g_fused_ffn_mtx);
+    for (auto & kv : g_fused_ffn_cache) {
+        if (kv.second.buf) {
+            ggml_backend_buffer_free(kv.second.buf);
+            kv.second.buf = nullptr;
+        }
+        if (kv.second.ctx) {
+            ggml_free(kv.second.ctx);
+            kv.second.ctx = nullptr;
+        }
+    }
+    g_fused_ffn_cache.clear();
+}
+
 } // namespace
 
 // FNV-1a over three 4 KiB windows (head / middle / tail) of a weight. Cheap enough for every graph
@@ -1036,9 +1054,13 @@ static ggml_tensor * dflash_fused_gate_up_weight(const llama_model & model, int 
         why = "gate/up use a backend-private (repacked or split) layout";
     }
 
-    static std::mutex mtx;
-    static auto & cache = *new std::unordered_map<const ggml_tensor *, dflash_fused_gate_up>(); // never destroyed on purpose
-    std::lock_guard<std::mutex> lock(mtx);
+    static std::once_flag atexit_flag;
+    std::call_once(atexit_flag, [] {
+        std::atexit(dflash_fused_gate_up_cleanup);
+    });
+
+    std::lock_guard<std::mutex> lock(g_fused_ffn_mtx);
+    auto & cache = g_fused_ffn_cache;
 
     const uint64_t fp = why ? 0 : (dflash_fused_ffn_fingerprint(gate) * 1099511628211ULL) ^ dflash_fused_ffn_fingerprint(up);
 
