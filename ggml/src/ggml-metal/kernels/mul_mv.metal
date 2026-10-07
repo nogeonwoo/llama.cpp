@@ -1226,6 +1226,33 @@ inline void pq2_0_dot_multicol(
 }
 
 
+// PQ2_0 weight unpack shared by the M=1 and multicolumn kernels. A 2-bit code c in {0,1,2,3} is written into the top two
+// mantissa bits of 1.0f, which is exactly 1 + c/4 in fp32. With w = c - 1 the block dot becomes
+//   sum(w_i*x_i) = 4*(sum((1 + c_i/4)*x_i) - 1.25*sum(x_i))
+// so the fp32 side is plain FMAs plus one folded offset, and the unpack is integer-only: shift, and, or = 3 ops per
+// weight, no floor and no int-to-float convert.
+// q is the quad qs[4m..4m+3] read as two little-endian 16-bit halves, so it needs 2-byte alignment only. That is all a
+// block gives: sizeof(block_pq2_0) is 34 and qs sits at +2, so a 4-byte load is misaligned in every other block.
+// Byte j of the quad holds weights 4j..4j+3 in bits [2k+1:2k]. The halves are zero-extended, so (h << (21 - bit))
+// never wraps and the mask isolates the field in bits 22:21.
+inline void pq2_0_unpack16(const ushort2 q, thread float4 * v) {
+    const uint4 sh0 = uint4(21u, 19u, 17u, 15u); // byte 0 of a half: fields at bits 0, 2, 4, 6
+    const uint4 sh1 = uint4(13u, 11u,  9u,  7u); // byte 1 of a half: fields at bits 8, 10, 12, 14
+    const uint4 msk = uint4(0x00600000u);
+    const uint4 one = uint4(0x3F800000u);
+    const uint4 lo  = uint4((uint) q.x);         // qs[4m+0], qs[4m+1]
+    const uint4 hi  = uint4((uint) q.y);         // qs[4m+2], qs[4m+3]
+
+    v[0] = as_type<float4>(one | ((lo << sh0) & msk));
+    v[1] = as_type<float4>(one | ((lo << sh1) & msk));
+    v[2] = as_type<float4>(one | ((hi << sh0) & msk));
+    v[3] = as_type<float4>(one | ((hi << sh1) & msk));
+}
+
+// M=1 decode. Per thread: one 16-weight slice (4 bytes) of one block per row; 8 threads span a block and a simdgroup
+// covers 4 blocks per iteration. Activations stay raw (float4 loads, src1 rows 16-byte aligned like in the multicol
+// kernel), the -1 weight offset is folded into the accumulator seed -1.25*sum(x), and per row the integer unpack
+// (phase 1) is kept apart from the fp32 FMAs (phase 2). Two accumulators halve the FMA dependency chain.
 template<int nr0, typename args_t>
 void kernel_mul_mv_pq2_0_f32_impl(
         args_t args,
@@ -1259,37 +1286,50 @@ void kernel_mul_mv_pq2_0_f32_impl(
         ax[row] = (device const block_pq2_0 *) ((device char *) src0 + offset0);
     }
 
-    float yl[16];
     float sumf[nr0] = {0.f};
 
     // group 128: 8 sub-blocks of 16 weights per PQ2_0 block
     const short ix = (tiisg/8);
     const short il = (tiisg%8)*16;
 
-    device const float * yb = y + ix*QK_PQ2_0 + il;
+    device const float4 * yb = (device const float4 *) (y + ix*QK_PQ2_0 + il);
 
     for (int ib = ix; ib < nb; ib += N_SIMDWIDTH/8) {
-        // stage the 16 activations once as base-4 collapse coefficients, reused per row;
-        // the floor chain yields fields top down, so the coefficients pair y_3 with g_1
-        float sumy = 0.f;
+        // the 16 activations as 4 float4, loaded once and reused by every row
+        float4 xc[4];
+        float  sumx = 0.f;
 
         FOR_UNROLL (short j = 0; j < 4; j++) {
-            const float y0 = yb[4*j + 0];
-            const float y1 = yb[4*j + 1];
-            const float y2 = yb[4*j + 2];
-            const float y3 = yb[4*j + 3];
-            sumy += (y0 + y1) + (y2 + y3);
-            yl[4*j + 0] = y3 - 4.0f*y2;
-            yl[4*j + 1] = y2 - 4.0f*y1;
-            yl[4*j + 2] = y1 - 4.0f*y0;
-            yl[4*j + 3] = y0;
+            xc[j] = yb[j];
+            sumx += (xc[j].x + xc[j].y) + (xc[j].z + xc[j].w);
         }
+
+        const float nsx = -1.25f * sumx;
 
         FOR_UNROLL (short row = 0; row < nr0; row++) {
-            sumf[row] += q2_dot_coeffs(ax[row] + ib, sumy, yl, il);
+            device const block_pq2_0 * qb = ax[row] + ib;
+            device const packed_ushort2 * qp = (device const packed_ushort2 *) (qb->qs + (il / 4));
+            const float d4 = (float) qb->d * 4.0f;
+
+            // phase 1: integer unpack into registers
+            float4 v[4];
+            pq2_0_unpack16(ushort2(*qp), v);
+
+            // phase 2: fp32 FMAs only, two independent chains
+            float acc0 = nsx;
+            float acc1 = 0.f;
+
+            FOR_UNROLL (short j = 0; j < 4; j++) {
+                acc0 = fma(v[j].x, xc[j].x, acc0);
+                acc1 = fma(v[j].y, xc[j].y, acc1);
+                acc0 = fma(v[j].z, xc[j].z, acc0);
+                acc1 = fma(v[j].w, xc[j].w, acc1);
+            }
+
+            sumf[row] = fma(d4, acc0 + acc1, sumf[row]);
         }
 
-        yb += QK_PQ2_0 * (N_SIMDWIDTH/8);
+        yb += (QK_PQ2_0/4) * (N_SIMDWIDTH/8);
     }
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
@@ -1315,6 +1355,15 @@ kernel void kernel_mul_mv_pq2_0_f32(
     kernel_mul_mv_pq2_0_f32_impl<N_R0_PQ2_0, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
 }
 
+inline float4 pq2_0_unpack_byte(const uint b) {
+    const uint4 sh  = uint4(21u, 19u, 17u, 15u);
+    const uint4 msk = uint4(0x00600000u);
+    const uint4 one = uint4(0x3F800000u);
+    return as_type<float4>(one | ((uint4(b) << sh) & msk));
+}
+
+// Multicolumn GEMV, nr1 activation columns per threadgroup. Launch geometry: NSG = 4 simdgroups, nr0 = 4 rows
+// each, 128 threads and 16 rows per threadgroup.
 template<int nr0, int nr1>
 kernel void kernel_mul_mv_pq2_0_multicol(
         constant ggml_metal_kargs_mul_mv & args,
@@ -1376,18 +1425,21 @@ kernel void kernel_mul_mv_pq2_0_multicol(
 
         FOR_UNROLL (short row = 0; row < nr0; row++) {
             device const block_pq2_0 * qb = ax[row] + (ib_chunk + ix);
-            device const uint8_t * qs = qb->qs + (il / 4);
-            const float d4 = (float)qb->d * 4.0f;
+            device const packed_ushort2 * qp = (device const packed_ushort2 *) (qb->qs + (il / 4));
+            const ushort2 w16 = *qp;
+            const float d4 = (float) qb->d * 4.0f;
+
+            const uint bytes[4] = {
+                (uint)(w16.x & 0xFF),
+                (uint)(w16.x >> 8),
+                (uint)(w16.y & 0xFF),
+                (uint)(w16.y >> 8),
+            };
 
             float acc[nr1] = {};
 
             FOR_UNROLL (short j = 0; j < 4; j++) {
-                const uint b = qs[j];
-                const uint c0 = (b >> 0) & 3;
-                const uint c1 = (b >> 2) & 3;
-                const uint c2 = (b >> 4) & 3;
-                const uint c3 = (b >> 6) & 3;
-                const float4 v = as_type<float4>(uint4(0x3F800000) | (uint4(c0, c1, c2, c3) << 21));
+                const float4 v = pq2_0_unpack_byte(bytes[j]);
 
                 FOR_UNROLL (short col = 0; col < nr1; ++col) {
                     acc[col] = fma(v.x, xc[col][j].x, acc[col]);
