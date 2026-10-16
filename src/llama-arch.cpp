@@ -703,6 +703,17 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_DFLASH_SELECTOR_PREV,                   "selector_predecessor" },
     { LLM_TENSOR_DFLASH_SELECTOR_NEXT,                   "selector_successor" },
     { LLM_TENSOR_DFLASH_SELECTOR_HIDDEN,                 "selector_hidden" },
+    { LLM_TENSOR_EAGLE_NORM_H,                           "norm_h" },
+    { LLM_TENSOR_EAGLE_NORM_E,                           "norm_e" },
+    { LLM_TENSOR_EAGLE_FUSE_PROJ,                        "fuse_proj" },
+    { LLM_TENSOR_EAGLE_CTX_MIXER,                        "ctx_mixer" },
+    { LLM_TENSOR_EAGLE_NORM_INNER,                       "norm_inner" },
+    { LLM_TENSOR_EAGLE_SWIGLU_GATE_UP,                   "swiglu_gate_up" },
+    { LLM_TENSOR_EAGLE_SWIGLU_DOWN,                      "swiglu_down" },
+    { LLM_TENSOR_EAGLE_STEP_HORIZON_BANK,                "step_horizon_bank" },
+    { LLM_TENSOR_EAGLE_OUT_PROJ,                         "out_proj" },
+    { LLM_TENSOR_EAGLE_NORM_OUT,                         "norm_out" },
+    { LLM_TENSOR_EAGLE_SCALE,                            "scale" },
 };
 
 // declare information about the model weight tensors:
@@ -1002,6 +1013,17 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_DFLASH_SELECTOR_PREV,       {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
     {LLM_TENSOR_DFLASH_SELECTOR_NEXT,       {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
     {LLM_TENSOR_DFLASH_SELECTOR_HIDDEN,     {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_EAGLE_NORM_H,               {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+    {LLM_TENSOR_EAGLE_NORM_E,               {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+    {LLM_TENSOR_EAGLE_FUSE_PROJ,            {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_EAGLE_CTX_MIXER,            {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_EAGLE_NORM_INNER,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+    {LLM_TENSOR_EAGLE_SWIGLU_GATE_UP,       {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_EAGLE_SWIGLU_DOWN,          {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_EAGLE_STEP_HORIZON_BANK,    {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_ADD}},
+    {LLM_TENSOR_EAGLE_OUT_PROJ,             {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_EAGLE_NORM_OUT,             {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+    {LLM_TENSOR_EAGLE_SCALE,                {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
 };
 
 LLM_KV::LLM_KV(llm_arch arch, const char * suffix) : arch(arch), suffix(suffix) {}

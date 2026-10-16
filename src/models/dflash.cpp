@@ -16,7 +16,7 @@
 
 void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
-    ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+    ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps, false);
     ml.get_key(LLM_KV_LOGIT_SCALE,                 hparams.f_logit_scale, false);
     hparams.f_final_logit_softcapping = 0.0f;
     ml.get_key(LLM_KV_FINAL_LOGIT_SOFTCAPPING,     hparams.f_final_logit_softcapping, false);
@@ -233,6 +233,29 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
         LLAMA_LOG_INFO("%s: DFlash2 conv kernel = %u, group = %u, selector rank = %u, top-k = %u\n", __func__,
                 hparams.dflash_conv_kernel_size, hparams.dflash_conv_group_size,
                 hparams.dflash_selector_rank, hparams.dflash_selector_top_k);
+    }
+
+    const struct ggml_tensor * eagle_fuse_meta = ml->get_tensor_meta("fuse_proj.weight");
+    if (eagle_fuse_meta) {
+        const int64_t d_inner = eagle_fuse_meta->ne[1];
+        const int64_t d_ffn_2 = ml->get_tensor_meta("swiglu_gate_up.weight")->ne[1];
+        const int64_t d_ffn   = d_ffn_2 / 2;
+        const int64_t n_slots = ml->get_tensor_meta("step_horizon_bank")->ne[1];
+
+        eagle_norm_h            = create_tensor(tn(LLM_TENSOR_EAGLE_NORM_H,            "weight"), { n_embd }, 0);
+        eagle_norm_e            = create_tensor(tn(LLM_TENSOR_EAGLE_NORM_E,            "weight"), { n_embd }, 0);
+        eagle_fuse_proj         = create_tensor(tn(LLM_TENSOR_EAGLE_FUSE_PROJ,         "weight"), { 2 * n_embd, d_inner }, 0);
+        eagle_ctx_mixer         = create_tensor(tn(LLM_TENSOR_EAGLE_CTX_MIXER,         "weight"), { d_inner, d_inner }, 0);
+        eagle_norm_inner        = create_tensor(tn(LLM_TENSOR_EAGLE_NORM_INNER,        "weight"), { d_inner }, 0);
+        eagle_swiglu_gate_up    = create_tensor(tn(LLM_TENSOR_EAGLE_SWIGLU_GATE_UP,    "weight"), { d_inner, d_ffn_2 }, 0);
+        eagle_swiglu_down       = create_tensor(tn(LLM_TENSOR_EAGLE_SWIGLU_DOWN,       "weight"), { d_ffn, d_inner }, 0);
+        eagle_step_horizon_bank = create_tensor(tn(LLM_TENSOR_EAGLE_STEP_HORIZON_BANK),          { d_inner, n_slots }, 0);
+        eagle_out_proj          = create_tensor(tn(LLM_TENSOR_EAGLE_OUT_PROJ,          "weight"), { d_inner, n_embd }, 0);
+        eagle_norm_out          = create_tensor(tn(LLM_TENSOR_EAGLE_NORM_OUT,          "weight"), { n_embd }, 0);
+        eagle_scale             = create_tensor(tn(LLM_TENSOR_EAGLE_SCALE),                       { 1 }, 0);
+
+        LLAMA_LOG_INFO("%s: Eagle-Lite M4 latent head loaded (d_inner = %lld, d_ffn = %lld, slots = %lld)\n",
+                __func__, (long long) d_inner, (long long) d_ffn, (long long) n_slots);
     }
 
     const struct ggml_tensor * fc_wa_meta = ml->get_tensor_meta("fc.weight_A");
@@ -1591,6 +1614,99 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         }
     }
 
+    if (n_layer == 0 && model.eagle_fuse_proj) {
+        if (inp_embd_tensor) {
+            ggml_tensor * h_anchor = ggml_view_2d(ctx0, inpL, n_embd, 1, inpL->nb[1], 0);
+            inpL = h_anchor; // index 0 (scratch anchor row)
+            ggml_tensor * h_curr = h_anchor;
+            for (int64_t i = 1; i < n_tokens; ++i) {
+                const int64_t step_idx = i - 1;
+
+                // 1. Dual RMSNorm on current state
+                ggml_tensor * h_n = build_norm(h_curr, model.eagle_norm_h, NULL, LLM_NORM_RMS, -1);
+                ggml_tensor * e_n = build_norm(h_curr, model.eagle_norm_e, NULL, LLM_NORM_RMS, -1);
+
+                // 2. Fusion projection: [2 * n_embd, 1] -> [d_inner, 1]
+                ggml_tensor * fused = ggml_concat(ctx0, h_n, e_n, 0);
+                ggml_tensor * z = ggml_mul_mat(ctx0, model.eagle_fuse_proj, fused);
+
+                // 3. Step-horizon conditioning bank
+                if (model.eagle_step_horizon_bank) {
+                    const int64_t n_slots = model.eagle_step_horizon_bank->ne[1];
+                    const int64_t bank_idx = std::min<int64_t>(std::max<int64_t>(step_idx, 0), n_slots - 1);
+                    const size_t offset_k = (size_t) bank_idx * model.eagle_step_horizon_bank->nb[1];
+                    ggml_tensor * step_bias = ggml_view_2d(ctx0, model.eagle_step_horizon_bank,
+                                                           model.eagle_step_horizon_bank->ne[0], 1,
+                                                           model.eagle_step_horizon_bank->nb[1], offset_k);
+                    ggml_tensor * z_cond = ggml_add(ctx0, z, step_bias);
+
+                    // 4. Context mixer
+                    ggml_tensor * act_cond = ggml_silu(ctx0, z_cond);
+                    ggml_tensor * mixed = ggml_mul_mat(ctx0, model.eagle_ctx_mixer, act_cond);
+                    z = ggml_add(ctx0, z, mixed);
+                }
+
+                // 5. SwiGLU FFN
+                ggml_tensor * z_norm = build_norm(z, model.eagle_norm_inner, NULL, LLM_NORM_RMS, -1);
+                ggml_tensor * gate_up = ggml_mul_mat(ctx0, model.eagle_swiglu_gate_up, z_norm);
+                const int64_t d_ffn = model.eagle_swiglu_down->ne[0];
+                ggml_tensor * gate_v = ggml_view_2d(ctx0, gate_up, d_ffn, 1, gate_up->nb[1], 0);
+                ggml_tensor * up_v   = ggml_view_2d(ctx0, gate_up, d_ffn, 1, gate_up->nb[1], (size_t) d_ffn * gate_up->nb[0]);
+                ggml_tensor * ffn_act = ggml_swiglu_split(ctx0, gate_v, up_v);
+                ggml_tensor * ffn_out = ggml_mul_mat(ctx0, model.eagle_swiglu_down, ffn_act);
+                z = ggml_add(ctx0, z, ffn_out);
+
+                // 6. Output projection & residual
+                ggml_tensor * delta_h = ggml_mul_mat(ctx0, model.eagle_out_proj, z);
+                if (model.eagle_scale) {
+                    delta_h = ggml_mul(ctx0, delta_h, model.eagle_scale);
+                }
+                ggml_tensor * h_next = ggml_add(ctx0, h_curr, delta_h);
+                if (model.eagle_norm_out) {
+                    h_next = build_norm(h_next, model.eagle_norm_out, NULL, LLM_NORM_RMS, -1);
+                }
+
+                inpL = ggml_concat(ctx0, inpL, h_next, 1);
+                h_curr = h_next;
+            }
+            cb(inpL, "eagle_lite_rollout", -1);
+            inpL = ggml_cont(ctx0, inpL);
+        } else {
+            ggml_tensor * h_n = build_norm(inpL, model.eagle_norm_h, NULL, LLM_NORM_RMS, -1);
+            ggml_tensor * e_n = build_norm(inpL, model.eagle_norm_e, NULL, LLM_NORM_RMS, -1);
+            ggml_tensor * fused = ggml_concat(ctx0, h_n, e_n, 0);
+            ggml_tensor * z = ggml_mul_mat(ctx0, model.eagle_fuse_proj, fused);
+            if (model.eagle_step_horizon_bank) {
+                const size_t offset_0 = 0;
+                ggml_tensor * step_bias = ggml_view_2d(ctx0, model.eagle_step_horizon_bank,
+                                                       model.eagle_step_horizon_bank->ne[0], 1,
+                                                       model.eagle_step_horizon_bank->nb[1], offset_0);
+                ggml_tensor * z_cond = ggml_add(ctx0, z, step_bias);
+                ggml_tensor * act_cond = ggml_silu(ctx0, z_cond);
+                ggml_tensor * mixed = ggml_mul_mat(ctx0, model.eagle_ctx_mixer, act_cond);
+                z = ggml_add(ctx0, z, mixed);
+            }
+            ggml_tensor * z_norm = build_norm(z, model.eagle_norm_inner, NULL, LLM_NORM_RMS, -1);
+            ggml_tensor * gate_up = ggml_mul_mat(ctx0, model.eagle_swiglu_gate_up, z_norm);
+            const int64_t d_ffn = model.eagle_swiglu_down->ne[0];
+            ggml_tensor * gate_v = ggml_view_2d(ctx0, gate_up, d_ffn, 1, gate_up->nb[1], 0);
+            ggml_tensor * up_v   = ggml_view_2d(ctx0, gate_up, d_ffn, 1, gate_up->nb[1], (size_t) d_ffn * gate_up->nb[0]);
+            ggml_tensor * ffn_act = ggml_swiglu_split(ctx0, gate_v, up_v);
+            ggml_tensor * ffn_out = ggml_mul_mat(ctx0, model.eagle_swiglu_down, ffn_act);
+            z = ggml_add(ctx0, z, ffn_out);
+            ggml_tensor * delta_h = ggml_mul_mat(ctx0, model.eagle_out_proj, z);
+            if (model.eagle_scale) {
+                delta_h = ggml_mul(ctx0, delta_h, model.eagle_scale);
+            }
+            ggml_tensor * h_next = ggml_add(ctx0, inpL, delta_h);
+            if (model.eagle_norm_out) {
+                h_next = build_norm(h_next, model.eagle_norm_out, NULL, LLM_NORM_RMS, -1);
+            }
+            inpL = h_next;
+            cb(inpL, "eagle_lite_out", -1);
+        }
+    }
+
     auto * output_norm = model.output_norm;
     if (output_norm == nullptr) {
         GGML_ASSERT(cparams.ctx_other != nullptr);
@@ -1621,7 +1737,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     // - For n_tokens = 3 (K=2): cuts LM head 3 -> 2 tokens (eliminating 3-wide SIMD penalty, saving ~6.6 ms)
     // - For n_tokens = 4 (K=3): keeping 4 tokens allows 4-wide SIMD GEMV (9.6 ms vs 12.4 ms for 3)
     // User can force via LLAMA_DFLASH_PRUNE_ROW0=1 or disable via LLAMA_DFLASH_PRUNE_ROW0=0.
-    const bool is_latent_head = (n_layer == 0 && model.fc_wa != nullptr && model.fc_wb != nullptr);
+    const bool is_latent_head = (n_layer == 0 && ((model.fc_wa != nullptr && model.fc_wb != nullptr) || model.eagle_fuse_proj != nullptr));
     const bool prune_optimal = (n_tokens == 2 || n_tokens == 3 || ((n_tokens - 1) % 4 == 0));
     const bool prune_row0 = ((model.dflash_selector_hidden != nullptr || is_latent_head) &&
                              n_tokens > 1 &&

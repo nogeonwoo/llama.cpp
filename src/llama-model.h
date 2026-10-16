@@ -684,6 +684,19 @@ struct llama_model {
     struct ggml_tensor * dflash_selector_next   = nullptr;
     struct ggml_tensor * dflash_selector_hidden = nullptr;
 
+    // eagle-lite latent head
+    struct ggml_tensor * eagle_norm_h            = nullptr;
+    struct ggml_tensor * eagle_norm_e            = nullptr;
+    struct ggml_tensor * eagle_fuse_proj         = nullptr;
+    struct ggml_tensor * eagle_ctx_mixer         = nullptr;
+    struct ggml_tensor * eagle_norm_inner        = nullptr;
+    struct ggml_tensor * eagle_swiglu_gate_up    = nullptr;
+    struct ggml_tensor * eagle_swiglu_down       = nullptr;
+    struct ggml_tensor * eagle_step_horizon_bank = nullptr;
+    struct ggml_tensor * eagle_out_proj          = nullptr;
+    struct ggml_tensor * eagle_norm_out          = nullptr;
+    struct ggml_tensor * eagle_scale             = nullptr;
+
     // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
     std::vector<int32_t> target_layer_ids;
 
