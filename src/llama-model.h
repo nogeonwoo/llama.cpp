@@ -322,6 +322,14 @@ struct llama_layer {
     struct ggml_tensor * ffn_down_enc = nullptr;
     struct ggml_tensor * ffn_up_enc   = nullptr;
 
+    // ff low-rank (Latent-DFlash Stage 3)
+    struct ggml_tensor * ffn_gate_wa   = nullptr;
+    struct ggml_tensor * ffn_gate_wb   = nullptr;
+    struct ggml_tensor * ffn_down_wa   = nullptr;
+    struct ggml_tensor * ffn_down_wb   = nullptr;
+    struct ggml_tensor * ffn_up_wa     = nullptr;
+    struct ggml_tensor * ffn_up_wb     = nullptr;
+
     // ff MoE
     struct ggml_tensor * ffn_gate_inp      = nullptr;
     struct ggml_tensor * ffn_gate_inp_s    = nullptr; // gemma4
@@ -646,6 +654,8 @@ struct llama_model {
     // eagle3 / dflash feature fusion layer
     struct ggml_tensor * fc   = nullptr;
     struct ggml_tensor * fc_s = nullptr;
+    struct ggml_tensor * fc_wa = nullptr;
+    struct ggml_tensor * fc_wb = nullptr;
     struct ggml_tensor * d2t = nullptr;  // draft to target vocabulary mapping
 
     // dspark

@@ -4,6 +4,7 @@
 #include "fit.h"
 #include "log.h"
 #include "reasoning-budget.h"
+#include "../src/llama-ext.h"
 
 #include "ggml.h"
 
@@ -135,7 +136,15 @@ struct common_sampler {
         const llama_model * model = llama_get_model(ctx);
         const llama_vocab * vocab = llama_model_get_vocab(model);
 
-        const int n_vocab = llama_vocab_n_tokens(vocab);
+        int n_vocab = llama_vocab_n_tokens(vocab);
+        if (n_vocab == 0) {
+            llama_context * ctx_other = llama_get_ctx_other(ctx);
+            if (ctx_other) {
+                model = llama_get_model(ctx_other);
+                vocab = llama_model_get_vocab(model);
+                n_vocab = llama_vocab_n_tokens(vocab);
+            }
+        }
 
         if (sampled_probs) {
             const uint32_t sampled_probs_count = llama_get_sampled_probs_count_ith(ctx, idx);
@@ -637,6 +646,10 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     llama_sampler_apply(chain, &cur_p);
 
+    if (cur_p.selected < 0 || (size_t) cur_p.selected >= cur_p.size) {
+        return LLAMA_TOKEN_NULL;
+    }
+
     id = cur_p.data[cur_p.selected].id;
 
     if (grammar_first || !grammar_should_apply(gsmpl)) {
@@ -684,6 +697,23 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     size_t i = 0;
     for (; i < draft.size(); i++) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+
+        static const bool spec_debug = std::getenv("LLAMA_SPEC_DEBUG") != nullptr;
+        if (spec_debug) {
+            auto sanitize_piece = [](std::string s) {
+                std::string out;
+                out.reserve(s.size());
+                for (char c : s) {
+                    if (c == '\n') out += "\\n";
+                    else if (c == '\r') out += "\\r";
+                    else out += c;
+                }
+                return out;
+            };
+            fprintf(stderr, "[debug-verify i=%zu] draft=%d ('%s') vs target=%d ('%s')\n",
+                    i, draft[i], sanitize_piece(common_token_to_piece(ctx, draft[i])).c_str(),
+                    id, sanitize_piece(common_token_to_piece(ctx, id)).c_str());
+        }
 
         common_sampler_accept(gsmpl, id, true);
 

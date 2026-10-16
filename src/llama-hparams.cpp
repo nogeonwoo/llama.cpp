@@ -51,6 +51,9 @@ uint32_t llama_hparams::n_head(uint32_t il) const {
     if (il < n_layer_all) {
         return n_head_arr[il];
     }
+    if (n_layer_all == 0) {
+        return 0;
+    }
 
     GGML_ABORT("fatal error");
 }
@@ -59,6 +62,9 @@ uint32_t llama_hparams::n_head_kv(uint32_t il) const {
     if (il < n_layer_all) {
         return n_head_kv_arr[il];
     }
+    if (n_layer_all == 0) {
+        return 0;
+    }
 
     GGML_ABORT("fatal error");
 }
@@ -66,6 +72,9 @@ uint32_t llama_hparams::n_head_kv(uint32_t il) const {
 uint32_t llama_hparams::n_ff(uint32_t il) const {
     if (il < n_layer_all) {
         return n_ff_arr[il];
+    }
+    if (n_layer_all == 0) {
+        return 0;
     }
 
     GGML_ABORT("fatal error");
@@ -85,6 +94,9 @@ uint32_t llama_hparams::n_gqa(uint32_t il) const {
 uint32_t llama_hparams::n_rot(uint32_t il) const {
     if (il < n_layer_all) {
         return is_swa(il) ? n_rot_swa : n_rot_full;
+    }
+    if (n_layer_all == 0) {
+        return 0;
     }
 
     GGML_ABORT("fatal error");
@@ -116,6 +128,9 @@ uint32_t llama_hparams::n_embd_head_k(uint32_t il) const {
     if (il < n_layer_all) {
         return is_swa(il) ? n_embd_head_k_swa : n_embd_head_k_full;
     }
+    if (n_layer_all == 0) {
+        return 0;
+    }
 
     GGML_ABORT("fatal error");
 }
@@ -124,23 +139,35 @@ uint32_t llama_hparams::n_embd_head_v(uint32_t il) const {
     if (il < n_layer_all) {
         return is_swa(il) ? n_embd_head_v_swa : n_embd_head_v_full;
     }
+    if (n_layer_all == 0) {
+        return 0;
+    }
 
     GGML_ABORT("fatal error");
 }
 
 uint32_t llama_hparams::n_embd_k_gqa(uint32_t il) const {
     const uint32_t n_head_kv = this->n_head_kv(il);
+    if (n_head_kv == 0) {
+        return 0;
+    }
 
     return n_embd_head_k(il) * n_head_kv;
 }
 
 uint32_t llama_hparams::n_embd_v_gqa(uint32_t il) const {
     const uint32_t n_head_kv = this->n_head_kv(il);
+    if (n_head_kv == 0) {
+        return 0;
+    }
 
     return n_embd_head_v(il) * n_head_kv;
 }
 
 bool llama_hparams::is_n_embd_k_gqa_variable() const {
+    if (n_layer_all == 0) {
+        return false;
+    }
     const uint32_t val = n_embd_k_gqa();
     for (uint32_t il = 0; il < n_layer_all; ++il) {
         if (val != n_embd_k_gqa(il)) {
@@ -152,6 +179,9 @@ bool llama_hparams::is_n_embd_k_gqa_variable() const {
 }
 
 bool llama_hparams::is_n_embd_v_gqa_variable() const {
+    if (n_layer_all == 0) {
+        return false;
+    }
     const uint32_t val = n_embd_v_gqa();
     for (uint32_t il = 0; il < n_layer_all; ++il) {
         if (val != n_embd_v_gqa(il)) {
@@ -163,6 +193,9 @@ bool llama_hparams::is_n_embd_v_gqa_variable() const {
 }
 
 uint32_t llama_hparams::n_embd_k_gqa_max() const {
+    if (n_layer_all == 0) {
+        return 0;
+    }
     uint32_t val = n_embd_k_gqa();
     for (uint32_t il = 0; il < n_layer_all; ++il) {
         val = std::max(val, n_embd_k_gqa(il));
@@ -172,6 +205,9 @@ uint32_t llama_hparams::n_embd_k_gqa_max() const {
 }
 
 uint32_t llama_hparams::n_embd_v_gqa_max() const {
+    if (n_layer_all == 0) {
+        return 0;
+    }
     uint32_t val = n_embd_v_gqa();
     for (uint32_t il = 0; il < n_layer_all; ++il) {
         val = std::max(val, n_embd_v_gqa(il));

@@ -587,7 +587,7 @@ llama_context::llama_context(
 
     // Initialize the full vocabulary token ids for backend samplers.
     {
-        const int n_vocab = model.vocab.n_tokens();
+        const int n_vocab = get_vocab().n_tokens();
 
         sampling.token_ids_full_vocab.resize(n_vocab);
         for (int i = 0; i < n_vocab; ++i) {
@@ -993,6 +993,13 @@ int64_t llama_context::output_resolve_row(int32_t i) const {
     return j;
 }
 
+const llama_vocab & llama_context::get_vocab() const {
+    if (model.vocab.n_tokens() == 0 && cparams.ctx_other != nullptr) {
+        return cparams.ctx_other->model.vocab;
+    }
+    return model.vocab;
+}
+
 float * llama_context::get_logits_ith(int32_t i) {
     output_reorder();
 
@@ -1002,7 +1009,7 @@ float * llama_context::get_logits_ith(int32_t i) {
         }
 
         const int64_t j = output_resolve_row(i);
-        return logits.data + j*model.vocab.n_tokens();
+        return logits.data + j*get_vocab().n_tokens();
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid logits id %d, reason: %s\n", __func__, i, err.what());
 #ifndef NDEBUG
@@ -1161,7 +1168,7 @@ float * llama_context::get_sampled_probs_ith(int32_t idx) {
         if ((size_t) row >= sampling.probs_count.size() || sampling.probs_count[row] == 0) {
             return nullptr;
         }
-        return sampling.probs.data + row*model.vocab.n_tokens();
+        return sampling.probs.data + row*get_vocab().n_tokens();
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid backend sampled probs id %d, reason: %s\n", __func__, idx, err.what());
         return nullptr;
@@ -1180,7 +1187,7 @@ float * llama_context::get_sampled_logits_ith(int32_t idx) {
         if ((size_t) row >= sampling.logits_count.size() || sampling.logits_count[row] == 0) {
             return nullptr;
         }
-        return sampling.logits.data + row*model.vocab.n_tokens();
+        return sampling.logits.data + row*get_vocab().n_tokens();
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid backend sampled logits id %d, reason: %s\n", __func__, idx, err.what());
         return nullptr;
@@ -1195,7 +1202,7 @@ const llama_token * llama_context::get_sampled_candidates_ith(int32_t idx) {
         if (sampling.candidates.has_data() &&
             (size_t) row < sampling.candidates_count.size() &&
             sampling.candidates_count[row] > 0) {
-            return sampling.candidates.data + row*model.vocab.n_tokens();
+            return sampling.candidates.data + row*get_vocab().n_tokens();
         }
     } catch (const std::exception & err) {
         // fallback to full vocab list
@@ -1228,7 +1235,7 @@ size_t llama_context::get_sampled_logits_count(int32_t idx) {
     output_reorder();
 
     if (!sampling.logits.has_data()) {
-        return model.vocab.n_tokens();
+        return get_vocab().n_tokens();
     }
 
     try {
@@ -1630,10 +1637,11 @@ int llama_context::encode(const llama_batch & batch_inp) {
 
     // eagle3/DFlash: features as encoder input, and non-draft paths fall back to model's input dim
     const int64_t n_embd = hparams.n_embd_inp_enc();
-    const int64_t n_vocab = model.vocab.n_tokens();
+    const auto & vocab = get_vocab();
+    const int64_t n_vocab = vocab.n_tokens();
 
     // note: during encode, we always pass the full sequence starting from pos = 0
-    if (!balloc->init(batch_inp, model.vocab, nullptr, n_embd, cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, true)) {
+    if (!balloc->init(batch_inp, vocab, nullptr, n_embd, cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, true)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
@@ -1884,7 +1892,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return -1;
     }
 
-    const auto & vocab   = model.vocab;
+    const auto & vocab   = get_vocab();
     const auto & hparams = model.hparams;
 
     const int64_t n_vocab = vocab.n_tokens();
@@ -2287,7 +2295,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
 uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const auto & hparams = model.hparams;
-    const auto & vocab   = model.vocab;
+    const auto & vocab   = get_vocab();
 
     const int64_t n_outputs_max = std::max<int64_t>(n_outputs, n_seq_max());
 
@@ -2484,7 +2492,7 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
 }
 
 void llama_context::output_reorder() {
-    const uint64_t n_vocab     = model.vocab.n_tokens();
+    const uint64_t n_vocab     = get_vocab().n_tokens();
     const uint64_t n_embd      = model.hparams.n_embd;
     const uint64_t n_embd_out  = model.hparams.n_embd_out();
 
@@ -3660,7 +3668,7 @@ void llama_context::opt_epoch_iter(
             batch.logits  [pos_batch]    = true;
         }
 
-        if (!balloc->init(batch, model.vocab, nullptr, model.hparams.n_embd_inp(), cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, true)) {
+        if (!balloc->init(batch, get_vocab(), nullptr, model.hparams.n_embd_inp(), cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, true)) {
             LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
             return;
         }

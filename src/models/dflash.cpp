@@ -235,7 +235,16 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
                 hparams.dflash_selector_rank, hparams.dflash_selector_top_k);
     }
 
-    fc              = create_tensor(tn(LLM_TENSOR_FC,              "weight"), { n_embd_inp, n_embd }, 0);
+    const struct ggml_tensor * fc_wa_meta = ml->get_tensor_meta("fc.weight_A");
+    const struct ggml_tensor * fc_wb_meta = ml->get_tensor_meta("fc.weight_B");
+    if (fc_wa_meta && fc_wb_meta) {
+        const int64_t rank = fc_wb_meta->ne[1];
+        fc_wb = create_tensor(tn(LLM_TENSOR_FC, "weight_B"), { n_embd_inp, rank }, 0);
+        fc_wa = create_tensor(tn(LLM_TENSOR_FC, "weight_A"), { rank, n_embd }, 0);
+        LLAMA_LOG_INFO("%s: DFlash low-rank fc projection (rank = %lld)\n", __func__, (long long) rank);
+    } else {
+        fc    = create_tensor(tn(LLM_TENSOR_FC, "weight"), { n_embd_inp, n_embd }, TENSOR_NOT_REQUIRED);
+    }
     fc_s            = create_tensor(tn(LLM_TENSOR_FC,              "scale"),  { 1 }, TENSOR_NOT_REQUIRED);
 
     // DFly replaces the encoder's single hidden_norm with a post-fusion context_norm, so
@@ -264,9 +273,9 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
             LLAMA_LOG_INFO("%s: DFly without predecessor correction\n", __func__);
         }
     } else {
-        output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), { n_embd }, 0); // encoder hidden_norm (after fc)
+        output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), { n_embd }, TENSOR_NOT_REQUIRED); // encoder hidden_norm (after fc)
     }
-    output_norm     = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM,    "weight"), { n_embd }, 0); // decoder final norm
+    output_norm     = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM,    "weight"), { n_embd }, TENSOR_NOT_REQUIRED); // decoder final norm
 
     // optional: reduced-vocab drafts ship their own lm head, full-vocab drafts can share the target's via ctx_other
     // a draft with its own embeddings + head references no target tensors and can run on devices the target does not use (e.g. -devd with a tensor-split target)
@@ -336,9 +345,23 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
         layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), { n_embd_head_k }, 0);
 
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), { n_embd }, 0);
-        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), { n_embd, n_ff }, 0);
-        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), { n_ff, n_embd }, 0);
-        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), { n_embd, n_ff }, 0);
+
+        const std::string gate_a_name = tn(LLM_TENSOR_FFN_GATE, "weight_A", i).str();
+        const bool has_lowrank = ml->get_tensor_meta(gate_a_name.c_str()) != nullptr;
+
+        if (has_lowrank) {
+            const int64_t rank = ml->get_tensor_meta(gate_a_name.c_str())->ne[0];
+            layer.ffn_gate_wa = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight_A", i), { rank, n_ff }, 0);
+            layer.ffn_gate_wb = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight_B", i), { n_embd, rank }, 0);
+            layer.ffn_up_wa   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight_A", i), { rank, n_ff }, 0);
+            layer.ffn_up_wb   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight_B", i), { n_embd, rank }, 0);
+            layer.ffn_down_wa = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight_A", i), { rank, n_embd }, 0);
+            layer.ffn_down_wb = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight_B", i), { n_ff, rank }, 0);
+        } else {
+            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), { n_embd, n_ff }, 0);
+            layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), { n_ff, n_embd }, 0);
+            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), { n_embd, n_ff }, 0);
+        }
 
         if (selector_meta) {
             const int64_t kernel = hparams.dflash_conv_kernel_size;
@@ -387,7 +410,29 @@ template <>
 llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     ggml_tensor * inp = build_inp_embd_enc();
 
-    ggml_tensor * cur = build_lora_mm(model.fc, inp, model.fc_s);
+    ggml_tensor * cur = nullptr;
+    if (model.fc_wa && model.fc_wb) {
+        if (n_layer == 0) {
+            ggml_tensor * normed = model.output_norm_enc ? build_norm(inp, model.output_norm_enc, NULL, LLM_NORM_RMS, -1) : inp;
+            ggml_tensor * z = ggml_mul_mat(ctx0, model.fc_wb, normed);
+            z = ggml_silu(ctx0, z);
+            ggml_tensor * delta = ggml_mul_mat(ctx0, model.fc_wa, z);
+            if (model.fc_s) {
+                delta = ggml_mul(ctx0, delta, model.fc_s);
+            }
+            cur = ggml_add(ctx0, inp, delta);
+        } else {
+            ggml_tensor * z = ggml_mul_mat(ctx0, model.fc_wb, inp);
+            cur = ggml_mul_mat(ctx0, model.fc_wa, z);
+            if (model.fc_s) {
+                cur = ggml_mul(ctx0, cur, model.fc_s);
+            }
+        }
+    } else if (model.fc) {
+        cur = build_lora_mm(model.fc, inp, model.fc_s);
+    } else {
+        cur = inp;
+    }
     cb(cur, "fc_out", -1);
 
     if (model.dfly_layer_fusion) {
@@ -422,8 +467,10 @@ llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_grap
         cur = ggml_reshape_2d(ctx0, cur, n_embd*n_lyr, n_tokens);
         cb(cur, "dfly_ctx_out", -1);
     } else {
-        cur = build_norm(cur, model.output_norm_enc, NULL, LLM_NORM_RMS, -1);
-        cb(cur, "enc_norm_out", -1);
+        if ((n_layer > 0 || !model.fc_wa) && model.output_norm_enc) {
+            cur = build_norm(cur, model.output_norm_enc, NULL, LLM_NORM_RMS, -1);
+            cb(cur, "enc_norm_out", -1);
+        }
     }
 
     ggml_set_output(cur);
@@ -1205,17 +1252,19 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
-    ggml_tensor * inp_pos  = build_inp_pos();
+    ggml_tensor * inp_pos  = n_layer > 0 ? build_inp_pos() : nullptr;
 
     // optional iSWA: pick the matching attention input
     const bool use_iswa = hparams.swa_type != LLAMA_SWA_TYPE_NONE;
 
     llm_graph_input_attn_kv      * inp_attn      = nullptr;
     llm_graph_input_attn_kv_iswa * inp_attn_iswa = nullptr;
-    if (use_iswa) {
-        inp_attn_iswa = build_attn_inp_kv_iswa();
-    } else {
-        inp_attn = build_attn_inp_kv();
+    if (n_layer > 0) {
+        if (use_iswa) {
+            inp_attn_iswa = build_attn_inp_kv_iswa();
+        } else {
+            inp_attn = build_attn_inp_kv();
+        }
     }
 
     const float kq_scale = 1.0f/sqrtf(float(n_embd_head));
@@ -1234,8 +1283,8 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
                     ext_factor, attn_factor, beta_fast, beta_slow);
     };
 
-    // KV cache injection
-    if (ubatch.embd) {
+    // KV cache injection (only for models with layers)
+    if (ubatch.embd && n_layer > 0) {
         // DFly ships one fused context per draft layer, so the incoming row is n_layer wide
         const bool    is_dfly      = model.dfly_layer_fusion != nullptr;
         const int64_t n_embd_batch = is_dfly ? (int64_t) hparams.n_embd_out() : n_embd;
@@ -1325,10 +1374,21 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     ggml_set_input(inp->tokens);
     res->t_inp_tokens = inp->tokens;
 
+    if (ubatch.embd) {
+        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_input(inp->embd);
+    }
+    ggml_tensor * inp_embd_tensor = inp->embd;
+
     ggml_tensor * inp_tokens = inp->tokens;
 
     ggml_tensor * inpL = build_embd_rows(tok_embd, inp->tokens);
     cb(inpL, "inp_noise_embd", -1);
+
+    if (inp_embd_tensor) {
+        std::array<ggml_tensor *, 2> inps = { inpL, inp_embd_tensor };
+        inpL = ggml_build_forward_select(gf, inps.data(), inps.size(), 1);
+    }
 
     // the DFly chain conditions position 1 on the block anchor's embedding; reuse the rows
     // gathered here instead of re-fetching by id, so the chain never indexes the embedding
@@ -1448,16 +1508,43 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         // LLAMA_DFLASH_FUSED_FFN=1: one [gate; up] GEMV + split + ggml_swiglu_split per layer. The helper
         // returns nullptr when the flag is 0/unset or the layer is not eligible (per-tensor scales, LoRA,
         // Hadamard-folded or mismatched gate/up); then the unmodified build_ffn path below is taken.
-        ggml_tensor * ffn_fused = build_dflash_fused_ffn(*this, model, cur, il);
-        if (ffn_fused) {
-            cur = ffn_fused;
+        if (layer.ffn_gate_wa && layer.ffn_gate_wb) {
+            // Low-rank factorized FFN (Latent-DFlash Stage 3)
+            ggml_tensor * z_gate = ggml_mul_mat(ctx0, layer.ffn_gate_wb, cur);
+            cb(z_gate, "ffn_gate_b", il);
+            ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ffn_gate_wa, z_gate);
+            cb(gate, "ffn_gate_a", il);
+            ggml_build_forward_expand(gf, gate);
+
+            ggml_tensor * z_up = ggml_mul_mat(ctx0, layer.ffn_up_wb, cur);
+            cb(z_up, "ffn_up_b", il);
+            ggml_tensor * up = ggml_mul_mat(ctx0, layer.ffn_up_wa, z_up);
+            cb(up, "ffn_up_a", il);
+            ggml_build_forward_expand(gf, up);
+
+            gate = ggml_silu(ctx0, gate);
+            cb(gate, "ffn_silu", il);
+
+            ggml_tensor * act = ggml_mul(ctx0, gate, up);
+            cb(act, "ffn_act", il);
+
+            ggml_tensor * z_down = ggml_mul_mat(ctx0, layer.ffn_down_wb, act);
+            cb(z_down, "ffn_down_b", il);
+            cur = ggml_mul_mat(ctx0, layer.ffn_down_wa, z_down);
+            cb(cur, "ffn_down_a", il);
+            ggml_build_forward_expand(gf, cur);
         } else {
-            cur = build_ffn(cur,
-                    layer.ffn_up,   NULL, layer.ffn_up_s,
-                    layer.ffn_gate, NULL, layer.ffn_gate_s,
-                    layer.ffn_down, NULL, layer.ffn_down_s,
-                    NULL,
-                    LLM_FFN_SILU, LLM_FFN_PAR, il);
+            ggml_tensor * ffn_fused = build_dflash_fused_ffn(*this, model, cur, il);
+            if (ffn_fused) {
+                cur = ffn_fused;
+            } else {
+                cur = build_ffn(cur,
+                        layer.ffn_up,   NULL, layer.ffn_up_s,
+                        layer.ffn_gate, NULL, layer.ffn_gate_s,
+                        layer.ffn_down, NULL, layer.ffn_down_s,
+                        NULL,
+                        LLM_FFN_SILU, LLM_FFN_PAR, il);
+            }
         }
         cb(cur, "ffn_out", il);
 
@@ -1472,7 +1559,47 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         inpL = cur;
     }
 
-    ggml_tensor * cur = build_norm(inpL, model.output_norm, NULL, LLM_NORM_RMS, -1);
+    if (n_layer == 0 && model.fc_wa && model.fc_wb) {
+        if (inp_embd_tensor) {
+            ggml_tensor * h_anchor = ggml_view_2d(ctx0, inpL, n_embd, 1, inpL->nb[1], 0);
+            inpL = h_anchor; // index 0 (scratch anchor row)
+            ggml_tensor * h_curr = h_anchor;
+            for (int64_t i = 1; i < n_tokens; ++i) {
+                ggml_tensor * normed = model.output_norm_enc ? build_norm(h_curr, model.output_norm_enc, NULL, LLM_NORM_RMS, -1) : h_curr;
+                ggml_tensor * z = ggml_mul_mat(ctx0, model.fc_wb, normed);
+                z = ggml_silu(ctx0, z);
+                ggml_tensor * delta = ggml_mul_mat(ctx0, model.fc_wa, z);
+                if (model.fc_s) {
+                    delta = ggml_mul(ctx0, delta, model.fc_s);
+                }
+                ggml_tensor * h_next = ggml_add(ctx0, h_curr, delta);
+                inpL = ggml_concat(ctx0, inpL, h_next, 1);
+                h_curr = h_next;
+            }
+            cb(inpL, "latent_head_rollout", -1);
+            inpL = ggml_cont(ctx0, inpL);
+        } else {
+            ggml_tensor * normed = model.output_norm_enc ? build_norm(inpL, model.output_norm_enc, NULL, LLM_NORM_RMS, -1) : inpL;
+            ggml_tensor * z = ggml_mul_mat(ctx0, model.fc_wb, normed);
+            z = ggml_silu(ctx0, z);
+            ggml_tensor * delta = ggml_mul_mat(ctx0, model.fc_wa, z);
+            if (model.fc_s) {
+                delta = ggml_mul(ctx0, delta, model.fc_s);
+            }
+            inpL = ggml_add(ctx0, inpL, delta);
+            cb(inpL, "latent_head_out", -1);
+        }
+    }
+
+    auto * output_norm = model.output_norm;
+    if (output_norm == nullptr) {
+        GGML_ASSERT(cparams.ctx_other != nullptr);
+        const auto * model_other = llama_get_model(cparams.ctx_other);
+        GGML_ASSERT(model_other->output_norm != nullptr && "DFlash decoder requires the target model's output_norm");
+        output_norm = model_other->output_norm;
+    }
+
+    ggml_tensor * cur = build_norm(inpL, output_norm, NULL, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
 
     res->t_embd = cur;
@@ -1494,8 +1621,9 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     // - For n_tokens = 3 (K=2): cuts LM head 3 -> 2 tokens (eliminating 3-wide SIMD penalty, saving ~6.6 ms)
     // - For n_tokens = 4 (K=3): keeping 4 tokens allows 4-wide SIMD GEMV (9.6 ms vs 12.4 ms for 3)
     // User can force via LLAMA_DFLASH_PRUNE_ROW0=1 or disable via LLAMA_DFLASH_PRUNE_ROW0=0.
+    const bool is_latent_head = (n_layer == 0 && model.fc_wa != nullptr && model.fc_wb != nullptr);
     const bool prune_optimal = (n_tokens == 2 || n_tokens == 3 || ((n_tokens - 1) % 4 == 0));
-    const bool prune_row0 = (model.dflash_selector_hidden != nullptr &&
+    const bool prune_row0 = ((model.dflash_selector_hidden != nullptr || is_latent_head) &&
                              n_tokens > 1 &&
                              ubatch.n_seqs_unq == 1 &&
                              (env_prune ? (std::atoi(env_prune) != 0) : prune_optimal));
@@ -1506,6 +1634,11 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     }
 
     cur = build_lora_mm(output, cur, output_s);
+
+    if (prune_row0 && model.dflash_selector_hidden == nullptr) {
+        ggml_tensor * row0_pad = ggml_view_2d(ctx0, cur, cur->ne[0], 1, cur->nb[1], 0);
+        cur = ggml_concat(ctx0, row0_pad, cur, 1);
+    }
 
     // DFlash2 feeds these logits to the selector, so they need the target's output
     // transforms; DFlash1 and DSpark read them through the sampler instead

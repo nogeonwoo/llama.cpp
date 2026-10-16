@@ -50,6 +50,7 @@ set(METALLIB_KERNEL_SOURCES
     kernels/argsort.metal
     kernels/pool.metal
     kernels/misc.metal
+    kernels/mul_mv_lowrank_fused.metal
 )
 
 if (GGML_METAL_EMBED_LIBRARY)
@@ -75,11 +76,15 @@ if (GGML_METAL_EMBED_LIBRARY)
         set(HEADERS_FOR_SRC ${METALLIB_KERNELS_COMMON})
         file(STRINGS ${SRC} _has_dequantize REGEX "#include \"dequantize\\.h\"")
         file(STRINGS ${SRC} _has_quantize   REGEX "#include \"quantize\\.h\"")
+        file(STRINGS ${SRC} _has_lowrank    REGEX "#include \"ggml-metal-lowrank\\.h\"")
         if(_has_dequantize)
             list(APPEND HEADERS_FOR_SRC ${METALLIB_KERNELS_DEQUANTIZE})
         endif()
         if(_has_quantize)
             list(APPEND HEADERS_FOR_SRC ${METALLIB_KERNELS_QUANTIZE})
+        endif()
+        if(_has_lowrank)
+            list(APPEND HEADERS_FOR_SRC ${CMAKE_CURRENT_SOURCE_DIR}/ggml-metal-lowrank.h)
         endif()
 
         add_custom_command(
@@ -87,7 +92,7 @@ if (GGML_METAL_EMBED_LIBRARY)
             # Step 1: concatenate shared headers + this kernel source
             COMMAND cat ${HEADERS_FOR_SRC} ${SRC} > "${EMBED}.tmp1"
             # Step 2: remove internal #include and #pragma once
-            COMMAND sed -e "/\#include \"common.h\"/d" -e "/\#include \"dequantize.h\"/d" -e "/\#include \"quantize.h\"/d" -e "/\#pragma once/d" < "${EMBED}.tmp1" > "${EMBED}.tmp2"
+            COMMAND sed -e "/\#include \"common.h\"/d" -e "/\#include \"dequantize.h\"/d" -e "/\#include \"quantize.h\"/d" -e "/\#include \"ggml-metal-lowrank.h\"/d" -e "/\#pragma once/d" < "${EMBED}.tmp1" > "${EMBED}.tmp2"
             # Step 3: inline ggml-common.h (replacing __embed_ggml-common.h__ sentinel)
             COMMAND sed -e "/__embed_ggml-common.h__/r ${METALLIB_COMMON}" -e "/__embed_ggml-common.h__/d" < "${EMBED}.tmp2" > "${EMBED}.tmp3"
             # Step 4: inline ggml-metal-impl.h
@@ -102,7 +107,7 @@ if (GGML_METAL_EMBED_LIBRARY)
             COMMAND echo .incbin "\"${EMBED}\""                                  >> "${ASM}"
             COMMAND echo ".globl _ggml_metallib_${kind_sym}_end"                 >> "${ASM}"
             COMMAND echo "_ggml_metallib_${kind_sym}_end:"                       >> "${ASM}"
-            DEPENDS ../ggml-common.h ggml-metal-impl.h
+            DEPENDS ../ggml-common.h ggml-metal-impl.h ggml-metal-lowrank.h
                     kernels/common.h kernels/dequantize.h kernels/quantize.h
                     kernels/${kind}.metal
             COMMENT "Generate embedded Metal library for ${kind}"

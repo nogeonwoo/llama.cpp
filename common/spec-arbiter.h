@@ -44,8 +44,8 @@ struct arbiter_params {
     int          warmup            = 3;     // observed cycles before any active K decision
     double       margin            = 0.04;  // promotion hysteresis margin m = 4%
     
-    // Hardware-calibrated empirical cycle times (ms) on Apple Silicon M3 (Code workload)
-    // Invariant: C_K = tv_K + td_K + th_K (102.7, 156.8, 274.1, 277.7 ms)
+    // Hardware-calibrated empirical cycle times (ms) on Apple Silicon M3 (Fused asym-Q2_K workload)
+    // Invariant: C_K = tv_K + td_K + th_K (102.7, 153.0, 258.4, 253.4 ms)
     double       C[arbiter_k_max + 1] = { 102.7, 156.8, 274.1, 277.7 };
 
     uint32_t     probe_iv_min      = 16;    // probe interval when parked in K=0
@@ -173,7 +173,7 @@ public:
     }
     double cost_seq_ms(int k) const noexcept {
         const size_t kk = (size_t) std::clamp(k, 0, arbiter_k_max);
-        return P_.C[kk];
+        return (last_measured_cycle_ms_[kk] > 0.0) ? last_measured_cycle_ms_[kk] : P_.C[kk];
     }
     // Expected cycle cost with overlap (ms):
     // hit  (prob h): tv + th + t_sync + (1 - eta) * td
@@ -299,8 +299,18 @@ public:
 
     // Compatibility shim for observe(...) call sites in speculative.cpp (Point 12)
     void observe(int k_drafted, int n_accepted, float draft_ms = 0.0f, float H_cycle = 0.0f) {
-        if (draft_ms > 0.0f && H_cycle > 0.0f && k_drafted >= 0 && k_drafted <= arbiter_k_max) {
-            last_measured_cycle_ms_[k_drafted] = H_cycle;
+        if (k_drafted >= 1 && k_drafted <= arbiter_k_max) {
+            if (draft_ms > 0.0f && td_ref_[k_drafted] > 0.0) {
+                const double scale = std::clamp((double) draft_ms / td_ref_[k_drafted], 0.20, 3.00);
+                for (int j = 1; j <= arbiter_k_max; ++j) {
+                    const double target_td = (j == k_drafted) ? (double) draft_ms : (td_ref_[j] * scale);
+                    td_[j] = (1.0 - P_.alpha) * td_[j] + P_.alpha * target_td;
+                    last_measured_cycle_ms_[j] = tv_[j] + td_[j] + th_[j];
+                }
+            }
+            if (H_cycle > 0.0f) {
+                last_measured_cycle_ms_[k_drafted] = (1.0 - P_.alpha) * last_measured_cycle_ms_[k_drafted] + P_.alpha * (double) H_cycle;
+            }
         }
         update_prefix(k_drafted, n_accepted);
     }
@@ -412,11 +422,20 @@ private:
             bail_counter_ = 0;
         }
 
-        // 2. Promotion: search for candidate k > k_cur that beats current TPS by margin
+        // 2. Promotion: search for candidate k > k_cur that beats current TPS by margin.
+        //    In <think> phase, cap block drafter (DFlash2) at K=1 (M=2) so early warmup hits
+        //    do not trigger M=4 (222 ms) verification on low-c2/c3 reasoning tokens, while
+        //    ngram-mod still drafts up to K=3 at 0 ms cost.
+        const int max_k_phase = (think_phase_ && P_.drafter == drafter_kind::BLOCK) ? 1 : arbiter_k_max;
+        if (k_cur_ > max_k_phase) {
+            set_k_(max_k_phase);
+            return;
+        }
+
         int best_promo_k = -1;
         double max_promo_tps = cur_tps * up_margin;
 
-        for (int k = k_cur_ + 1; k <= arbiter_k_max; ++k) {
+        for (int k = k_cur_ + 1; k <= max_k_phase; ++k) {
             if (!P_.allow_k2 && k == 2) {
                 continue;
             }
@@ -467,10 +486,11 @@ private:
     uint64_t total_cycles_ = 0;
     bool     think_phase_  = false;
 
-    // Stage S8 calibrated component latencies (CALIBRATION_MATRIX.md, Code workload, ms)
-    std::array<double, arbiter_k_max + 1> tv_ = { 100.6, 130.3, 230.3, 222.0 }; // Target GPU
-    std::array<double, arbiter_k_max + 1> td_ = {   0.0,  24.3,  39.7,  51.1 }; // Draft (DFlash proc + forward)
-    std::array<double, arbiter_k_max + 1> th_ = {   2.1,   2.2,   4.1,   4.6 }; // Host residual (C_K - tv - td)
+    // Stage S8 calibrated component latencies (Fused asym-Q2_K DFlash2 on M3, ms)
+    std::array<double, arbiter_k_max + 1> tv_     = { 100.6, 130.3, 230.3, 222.0 }; // Target GPU
+    std::array<double, arbiter_k_max + 1> td_     = {   0.0,  24.3,  39.7,  51.1 }; // Draft (DFlash proc + forward)
+    std::array<double, arbiter_k_max + 1> td_ref_ = {   0.0,  24.3,  39.7,  51.1 }; // Reference Draft latency for scaling
+    std::array<double, arbiter_k_max + 1> th_     = {   2.1,   2.2,   4.1,   4.6 }; // Host residual (C_K - tv - td)
     double                                g_  = 0.85; // online EMA of anchor match rate
 };
 

@@ -1,4 +1,6 @@
 #include <cstdlib>
+#include <cstdio>
+#include <atomic>
 #include "ggml-metal-ops.h"
 
 #include "ggml.h"
@@ -9,6 +11,7 @@
 #include "ggml-metal-common.h"
 #include "ggml-metal-device.h"
 #include "ggml-metal-tuning.h"
+#include "ggml-metal-lowrank.h"
 
 #include <cassert>
 #include <algorithm>
@@ -2747,7 +2750,110 @@ static bool ggml_metal_op_mul_mat_q1_0_pc_supported(const ggml_tensor * op) {
     return ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1;
 }
 
+// ===== Latent-DFlash: fused low-rank FFN projection  y = A . (B . x)  (Q4_K factors, rank 256) =======
+
+// MUL_MAT(B, x) -> MUL_MAT(A, Z) where Z has no other consumer and both weights are rank-256 Q4_K factors
+static bool ggml_metal_op_lowrank_fusable(ggml_metal_op_t ctx, int idx) {
+    static const bool disabled = getenv("GGML_METAL_LOWRANK_FUSED_DISABLE") != nullptr;
+    if (disabled || !ctx->use_fusion) {
+        return false;
+    }
+
+    if (idx + 1 >= ctx->n_nodes()) {
+        return false;
+    }
+
+    const int pair[2] = { ctx->gf_index(idx), ctx->gf_index(idx + 1) };
+    const int out_idx = pair[1];
+    const ggml_op ops[2] = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT };
+    if (!ggml_can_fuse_subgraph_ext(ctx->graph(), pair, 2, ops, &out_idx, 1)) {
+        return false;
+    }
+
+    const ggml_tensor * mm0 = ctx->node(idx);
+    const ggml_tensor * mm1 = ctx->node(idx + 1);
+
+    const ggml_tensor * B = mm0->src[0];    // [D_in, 256]
+    const ggml_tensor * x = mm0->src[1];    // [D_in, n_cols]
+    const ggml_tensor * A = mm1->src[0];    // [256, D_out]
+
+    return mm1->src[1] == mm0
+        && B->type   == GGML_TYPE_Q4_K && A->type == GGML_TYPE_Q4_K
+        && x->type   == GGML_TYPE_F32  && mm0->type == GGML_TYPE_F32 && mm1->type == GGML_TYPE_F32
+        && B->ne[1]  == LOWRANK_FUSED_RANK && A->ne[0] == LOWRANK_FUSED_RANK
+        && B->ne[0]  %  256 == 0
+        && x->ne[1]  >= 1 && x->ne[1] <= LOWRANK_FUSED_MAX_COLS
+        && x->ne[2]  == 1 && x->ne[3] == 1
+        && B->ne[2]  == 1 && B->ne[3] == 1 && A->ne[2] == 1 && A->ne[3] == 1
+        && ggml_is_contiguous(B) && ggml_is_contiguous(A)
+        && x->nb[0]  == sizeof(float) && mm1->nb[0] == sizeof(float)
+        && B->nb[1]  % 16 == 0 && A->nb[1] % 16 == 0 && x->nb[1] % 16 == 0;
+}
+
+// every threadgroup recomputes Z, so n_tg ~ 1-2 per GPU core; override with GGML_METAL_LOWRANK_NTG
+static int ggml_metal_op_lowrank_ntg(int64_t d_out) {
+    static const int cfg = []() {
+        const char * s = getenv("GGML_METAL_LOWRANK_NTG");
+        const int    v = s ? atoi(s) : 10;
+        return v > 0 ? v : 10;
+    }();
+    const int64_t row_groups = (d_out + 15) / 16;
+    return (int) std::max<int64_t>(1, std::min<int64_t>(cfg, row_groups));
+}
+
+static int ggml_metal_op_mul_mat_lowrank_fused(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * mm0 = ctx->node(idx);
+    ggml_tensor * mm1 = ctx->node(idx + 1);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * B = mm0->src[0];
+    const ggml_tensor * x = mm0->src[1];
+    const ggml_tensor * A = mm1->src[0];
+
+    const char * kname = "kernel_mul_mv_lowrank_fused_q4_k";
+
+    static std::atomic<int> s_fused_invocations{0};
+    const int inv = s_fused_invocations.fetch_add(1);
+    if (inv == 0) {
+        fprintf(stderr, "\n[ggml-metal] Low-rank fused kernel active: %s (D_in=%d, rank=%d, D_out=%d, cols=%d)\n",
+                kname, (int)B->ne[0], (int)B->ne[1], (int)A->ne[1], (int)x->ne[1]);
+    }
+
+    auto pipeline = ggml_metal_library_compile_pipeline(lib, kname, kname, nullptr);
+
+    ggml_metal_kargs_mul_mv_lowrank_fused args = {
+        /*.ne00 =*/ (int32_t) B->ne[0],
+        /*.ne0  =*/ (int32_t) A->ne[1],
+        /*.ne11 =*/ (int32_t) x->ne[1],
+        /*._pad =*/ 0,
+        /*.nb01 =*/ B->nb[1],
+        /*.nb1A =*/ A->nb[1],
+        /*.nb11 =*/ x->nb[1],
+        /*.nb1  =*/ mm1->nb[1],
+    };
+
+    const int ntg = ggml_metal_op_lowrank_ntg(A->ne[1]);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(B),   1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(A),   2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(x),   3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mm1), 4);
+
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, LOWRANK_FUSED_SMEM, 0);
+    ggml_metal_encoder_dispatch_threadgroups(enc, ntg, (int) x->ne[1], 1, LOWRANK_FUSED_NTHREADS, 1, 1);
+
+    return 2;   // consumed MUL_MAT(B, x) and MUL_MAT(A, Z); Z is never materialised
+}
+
 int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
+    if (ggml_metal_op_lowrank_fusable(ctx, idx)) {
+        return ggml_metal_op_mul_mat_lowrank_fused(ctx, idx);
+    }
+
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -2898,7 +3004,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
            op->src[0]->type == GGML_TYPE_Q6_K ||
            op->src[0]->type == GGML_TYPE_Q2_K ||
            op->src[0]->type == GGML_TYPE_Q3_K ||
-           false) && (ne11 >= 4 && ne11 <= 8)
+           false) && (ne11 >= 2 && ne11 <= 8)
          )
         )
        ) {

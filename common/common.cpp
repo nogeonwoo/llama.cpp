@@ -6,6 +6,7 @@
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
+#include "../src/llama-ext.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "unicode.h"
@@ -1579,6 +1580,10 @@ char * common_get_model_or_exit(int argc, char * argv[]) {
 }
 
 common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
+    if (llama_model_n_layer(llama_get_model(ctx)) == 0) {
+        return COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+    }
+
     auto * mem = llama_get_memory(ctx);
     if (mem == nullptr) {
         return COMMON_CONTEXT_SEQ_RM_TYPE_NO;
@@ -1906,6 +1911,12 @@ std::vector<llama_token> common_tokenize(
 std::string common_token_to_piece(const struct llama_context * ctx, llama_token token, bool special) {
     const llama_model * model = llama_get_model(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);
+    if (llama_vocab_n_tokens(vocab) == 0) {
+        llama_context * ctx_other = llama_get_ctx_other(const_cast<struct llama_context *>(ctx));
+        if (ctx_other) {
+            vocab = llama_model_get_vocab(llama_get_model(ctx_other));
+        }
+    }
     return common_token_to_piece(vocab, token, special);
 }
 

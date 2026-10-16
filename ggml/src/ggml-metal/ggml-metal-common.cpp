@@ -1,4 +1,5 @@
 #include "ggml-metal-common.h"
+#include "ggml-metal-lowrank.h"
 
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
@@ -425,6 +426,20 @@ void ggml_graph_optimize(ggml_cgraph * gf) {
 
                 // the .dst() becomes the last fused tensor
                 node.add_fused(gf->nodes[i]);
+            }
+        } else if (node.op() == GGML_OP_MUL_MAT && i + 1 < n && gf->nodes[i+1]->op == GGML_OP_MUL_MAT) {
+            ggml_tensor * mm0 = gf->nodes[i];
+            ggml_tensor * mm1 = gf->nodes[i+1];
+            if (mm1->src[1] == mm0 && mm0->src[0] && mm1->src[0] &&
+                mm0->src[0]->type == GGML_TYPE_Q4_K && mm1->src[0]->type == GGML_TYPE_Q4_K &&
+                mm0->src[0]->ne[1] == LOWRANK_FUSED_RANK && mm1->src[0]->ne[0] == LOWRANK_FUSED_RANK) {
+                const int pair[2] = { i, i + 1 };
+                const int out_idx = i + 1;
+                const ggml_op ops_lowrank[2] = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT };
+                if (ggml_can_fuse_subgraph_ext(gf, pair, 2, ops_lowrank, &out_idx, 1)) {
+                    ++i;
+                    node.add_fused(gf->nodes[i]);
+                }
             }
         }
 

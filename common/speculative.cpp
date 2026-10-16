@@ -24,6 +24,7 @@
 #include "ngram-mod.h"
 #include "sampling.h"
 #include "spec-arbiter.h"
+#include "spec-tree-m4.h"
 #include "speculative-tap.h"
 
 #include <algorithm>
@@ -2031,6 +2032,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     std::vector<int64_t>       cycle_count;
     std::vector<int64_t>       accept_count;
     std::vector<float>         last_draft_ms;
+    std::vector<prism::m4::tree_batch_plan_m4> last_tree_plan;
 
     // -----------------------------------------------------------------------------------------------------------
     // Stage S8: asynchronous worker pipeline (public entry points: common_speculative_pipeline_* in speculative-tap.h)
@@ -2073,6 +2075,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     bool         take_la_valid = false;
     llama_token  take_la_token = -1;
     float        take_draft_ms = 0.0f;
+
+    std::vector<std::vector<float>> last_target_h;
+    std::vector<std::vector<float>> current_batch_h;
 
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
@@ -2122,6 +2127,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         selector_top_k = llama_model_dflash_selector_top_k(model_dft);
         is_dflash2     = selector_top_k > 0;
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
+        if (mask_token_id == LLAMA_TOKEN_NULL && model_tgt) {
+            mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_tgt));
+        }
+        if (mask_token_id == LLAMA_TOKEN_NULL) {
+            char buf[32] = {};
+            if (llama_model_meta_val_str(model_dft, "tokenizer.ggml.mask_token_id", buf, sizeof(buf)) >= 0 ||
+                llama_model_meta_val_str(model_dft, "dflash.mask_token_id", buf, sizeof(buf)) >= 0) {
+                mask_token_id = std::atoi(buf);
+            }
+        }
 
         // without a mask token every masked slot is drafted as token id -1: runs, accepts nothing,
         // and reads as a bad drafter instead of a bad conversion that dropped the vocab
@@ -2180,6 +2195,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         cycle_count.assign(n_seq, 0);
         accept_count.assign(n_seq, 0);
         last_draft_ms.assign(n_seq, 0.0f);
+        last_tree_plan.resize(n_seq);
 
         LOG_INF("%s: speculative arbiter initialized (mode=%s, drafter=%s, think_start=%d, think_end=%d, log_interval=%d, n_seq=%u)\n",
                 __func__, arbiter_mode_str.c_str(), dkind == spec::drafter_kind::BLOCK ? "block" : "ar",
@@ -2201,7 +2217,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             this->params.n_min = std::min(this->params.n_min, n_draft_max);
         }
 
-        batch        = llama_batch_init(llama_n_batch(ctx_dft), 0,          n_seq);
+        const bool is_latent_head = (llama_model_n_layer(model_dft) == 0);
+        batch        = llama_batch_init(llama_n_batch(ctx_dft), is_latent_head ? n_embd_tgt : 0, n_seq);
+        if (is_latent_head && batch.token == nullptr) {
+            batch.token = (llama_token *) malloc(sizeof(llama_token) * llama_n_batch(ctx_dft));
+        }
+        last_target_h.assign(n_seq, std::vector<float>(n_embd_tgt, 0.0f));
+        current_batch_h.resize(n_seq);
         batch_inject = llama_batch_init(llama_n_batch(ctx_dft), n_embd_dec, n_seq);
 
         // embd batches on an M-RoPE draft need 4 position rows per token
@@ -2217,7 +2239,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             sparams.no_perf  = false;
             sparams.top_k    = 10;
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
-            s.reset(common_sampler_init(model_dft, sparams));
+            s.reset(common_sampler_init(model_tgt ? model_tgt : model_dft, sparams));
         }
 
         // offload draft sampling to the backend
@@ -2267,6 +2289,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     cycle_count[seq_id] == accept_count[seq_id] ? "VERIFIED" : "MISMATCH");
         }
 
+        if (batch.token != nullptr && llama_model_n_layer(llama_get_model(this->params.ctx_dft)) == 0) {
+            free(batch.token);
+            batch.token = nullptr;
+        }
         llama_batch_free(batch);
         llama_batch_free(batch_inject);
     }
@@ -2279,6 +2305,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // Shared by process() (rows from llama_get_embeddings_layer_inp) and the worker (rows from the tap).
     bool ingest_rows(llama_seq_id seq_id, int32_t n_rows, const std::vector<const float *> & layer_rows, const llama_pos * pos) {
         auto * ctx_dft = this->params.ctx_dft;
+        if (llama_model_n_layer(llama_get_model(ctx_dft)) == 0) {
+            return true;
+        }
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
 
@@ -2329,27 +2358,29 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
             GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
 
-            // inject the DFlash decoder K/V cache at the tokens' target positions
-            batch_inject.n_tokens = n_chunk;
-            std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
+            if (llama_model_n_layer(llama_get_model(ctx_dft)) > 0) {
+                // inject the DFlash decoder K/V cache at the tokens' target positions
+                batch_inject.n_tokens = n_chunk;
+                std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
 
-            for (int32_t i = 0; i < n_chunk; ++i) {
-                const llama_pos p = pos[offset + i];
-                batch_inject.pos[i] = p;
-                if (is_mrope) {
-                    batch_inject.pos[1 * n_chunk + i] = p;
-                    batch_inject.pos[2 * n_chunk + i] = p;
-                    batch_inject.pos[3 * n_chunk + i] = 0;
+                for (int32_t i = 0; i < n_chunk; ++i) {
+                    const llama_pos p = pos[offset + i];
+                    batch_inject.pos[i] = p;
+                    if (is_mrope) {
+                        batch_inject.pos[1 * n_chunk + i] = p;
+                        batch_inject.pos[2 * n_chunk + i] = p;
+                        batch_inject.pos[3 * n_chunk + i] = 0;
+                    }
+                    batch_inject.n_seq_id[i]  = 1;
+                    batch_inject.seq_id[i][0] = seq_id;
+                    batch_inject.logits[i]    = false;
                 }
-                batch_inject.n_seq_id[i]  = 1;
-                batch_inject.seq_id[i][0] = seq_id;
-                batch_inject.logits[i]    = false;
-            }
-            rc = llama_decode(ctx_dft, batch_inject);
-            if (rc != 0) {
-                LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
-                        __func__, rc, (int) n_chunk, (int) offset);
-                return false;
+                rc = llama_decode(ctx_dft, batch_inject);
+                if (rc != 0) {
+                    LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
+                            __func__, rc, (int) n_chunk, (int) offset);
+                    return false;
+                }
             }
         }
 
@@ -2383,7 +2414,112 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             const float * lattice = llama_get_embeddings_nextn(ctx_dft);
             GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
 
+            // Extract candidate statistics for M=4 tree speculation
+            prism::m4::draft_step_candidates_m4 cand{};
             int32_t predecessor = 0;
+
+            if (n_block_tokens > 1 && selector_top_k > 0) {
+                // Step 1 (Depth 1): conditioned on root anchor (predecessor = 0)
+                const float * row1 = lattice + (size_t) (beg + 1) * n_embd_dec;
+                const float * scores1 = row1 + selector_top_k; // predecessor 0
+
+                int32_t top1_idx = 0;
+                int32_t top2_idx = -1;
+                float max1 = -std::numeric_limits<float>::infinity();
+                float max2 = -std::numeric_limits<float>::infinity();
+                for (int32_t k = 0; k < selector_top_k; ++k) {
+                    if (scores1[k] > max1) {
+                        max2 = max1;
+                        top2_idx = top1_idx;
+                        max1 = scores1[k];
+                        top1_idx = k;
+                    } else if (top2_idx < 0 || scores1[k] > max2) {
+                        max2 = scores1[k];
+                        top2_idx = k;
+                    }
+                }
+                float sum_exp1 = 0.0f;
+                for (int32_t k = 0; k < selector_top_k; ++k) {
+                    sum_exp1 += std::exp(scores1[k] - max1);
+                }
+                cand.d1_top1_id   = (llama_token) row1[top1_idx];
+                cand.d1_top1_prob = (sum_exp1 > 0.0f) ? (1.0f / sum_exp1) : 0.0f;
+                if (top2_idx >= 0 && sum_exp1 > 0.0f) {
+                    cand.d1_top2_id   = (llama_token) row1[top2_idx];
+                    cand.d1_top2_prob = std::exp(scores1[top2_idx] - max1) / sum_exp1;
+                }
+
+                // Step 2 (Depth 2): conditioned on Step 1 top-1
+                int32_t d2_top1_idx = 0;
+                if (n_block_tokens > 2) {
+                    const float * row2 = lattice + (size_t) (beg + 2) * n_embd_dec;
+                    const float * scores2 = row2 + selector_top_k + (size_t) top1_idx * selector_top_k;
+
+                    int32_t d2_top2_idx = -1;
+                    float d2_max1 = -std::numeric_limits<float>::infinity();
+                    float d2_max2 = -std::numeric_limits<float>::infinity();
+                    for (int32_t k = 0; k < selector_top_k; ++k) {
+                        if (scores2[k] > d2_max1) {
+                            d2_max2 = d2_max1;
+                            d2_top2_idx = d2_top1_idx;
+                            d2_max1 = scores2[k];
+                            d2_top1_idx = k;
+                        } else if (d2_top2_idx < 0 || scores2[k] > d2_max2) {
+                            d2_max2 = scores2[k];
+                            d2_top2_idx = k;
+                        }
+                    }
+                    float sum_exp2 = 0.0f;
+                    for (int32_t k = 0; k < selector_top_k; ++k) {
+                        sum_exp2 += std::exp(scores2[k] - d2_max1);
+                    }
+                    cand.d2_top1_id   = (llama_token) row2[d2_top1_idx];
+                    cand.d2_top1_prob = (sum_exp2 > 0.0f) ? (1.0f / sum_exp2) : 0.0f;
+                    if (d2_top2_idx >= 0 && sum_exp2 > 0.0f) {
+                        cand.d2_top2_id   = (llama_token) row2[d2_top2_idx];
+                        cand.d2_top2_prob = std::exp(scores2[d2_top2_idx] - d2_max1) / sum_exp2;
+                    }
+                }
+
+                // Step 3 (Depth 3): conditioned on Step 2 top-1
+                if (n_block_tokens > 3) {
+                    const float * row3 = lattice + (size_t) (beg + 3) * n_embd_dec;
+                    const float * scores3 = row3 + selector_top_k + (size_t) d2_top1_idx * selector_top_k;
+
+                    int32_t d3_top1_idx = 0;
+                    float d3_max1 = -std::numeric_limits<float>::infinity();
+                    for (int32_t k = 0; k < selector_top_k; ++k) {
+                        if (scores3[k] > d3_max1) {
+                            d3_max1 = scores3[k];
+                            d3_top1_idx = k;
+                        }
+                    }
+                    float sum_exp3 = 0.0f;
+                    for (int32_t k = 0; k < selector_top_k; ++k) {
+                        sum_exp3 += std::exp(scores3[k] - d3_max1);
+                    }
+                    cand.d3_top1_id   = (llama_token) row3[d3_top1_idx];
+                    cand.d3_top1_prob = (sum_exp3 > 0.0f) ? (1.0f / sum_exp3) : 0.0f;
+                }
+
+                const prism::m4::tree_topology_m4 topo = prism::m4::select_tree_topology_m4(cand);
+                const llama_token root_token = (batch.token && beg < batch.n_tokens) ? batch.token[beg] : 0;
+                if (seq_id >= 0 && seq_id < (llama_seq_id) last_tree_plan.size()) {
+                    last_tree_plan[seq_id] = prism::m4::build_tree_batch_plan_m4(root_token, cand, topo);
+                }
+
+                if (std::getenv("LLAMA_SPEC_DEBUG") != nullptr) {
+                    const char * topo_str = "LINEAR_K3";
+                    if (topo == prism::m4::tree_topology_m4::BRANCHED_Y1) topo_str = "BRANCHED_Y1";
+                    else if (topo == prism::m4::tree_topology_m4::FORKED_Y2) topo_str = "FORKED_Y2";
+                    fprintf(stderr, "[spec-tree-m4 seq=%d] topo=%s | d1=(tok=%d p=%.3f, tok=%d p=%.3f) d2=(tok=%d p=%.3f, tok=%d p=%.3f) d3=(tok=%d p=%.3f)\n",
+                            (int) seq_id, topo_str,
+                            cand.d1_top1_id, cand.d1_top1_prob, cand.d1_top2_id, cand.d1_top2_prob,
+                            cand.d2_top1_id, cand.d2_top1_prob, cand.d2_top2_id, cand.d2_top2_prob,
+                            cand.d3_top1_id, cand.d3_top1_prob);
+                }
+            }
+
             for (int32_t i = 1; i < n_block_tokens; ++i) {
                 const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
                 const float * scores = row + selector_top_k + (size_t) predecessor * selector_top_k;
@@ -2424,6 +2560,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 common_sampler_sample(smpl, ctx_dft, idx, true);
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
+                if (!cur_p || cur_p->size == 0) {
+                    break;
+                }
 
                 for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
                     LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
@@ -2443,11 +2582,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 common_sampler_sample(smpl, ctx_dft, beg + i, true);
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
-
-                for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
-                    LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
-                            seq_id, k, i - 1, cur_p->data[k].id, cur_p->data[k].p,
-                            common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                if (!cur_p || cur_p->size == 0) {
+                    break;
                 }
 
                 const llama_token id = cur_p->data[0].id;
@@ -2481,6 +2617,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         for (int32_t i = 0; i < n_block_tokens; ++i) {
             common_batch_add(batch, i == 0 ? id_anchor : mask_token_id, pos_anchor + i, { seq_id }, !is_dflash2);
         }
+        if (batch.embd && seq_id < (llama_seq_id) last_target_h.size() && !last_target_h[seq_id].empty()) {
+            std::memcpy(batch.embd, last_target_h[seq_id].data(), (size_t) n_embd_tgt * sizeof(float));
+        }
 
         const int64_t t0 = ggml_time_us();
         const int ret = llama_decode(ctx_dft, batch);
@@ -2494,14 +2633,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 (int) batch.n_tokens, total_ms, enq_ms, sync_ms);
         if (ret != 0) {
             LOG_WRN("%s: llama_decode(ctx_dft) returned %d\n", __func__, ret);
-            llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, pos_anchor, -1);
+            if (llama_model_n_layer(llama_get_model(ctx_dft)) > 0) {
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, pos_anchor, -1);
+            }
             return false;
         }
 
         read_block_result(seq_id, 0, n_block_tokens, result);
 
         // the block rows are scratch: drop them so the draft KV cache holds only target-feature rows
-        return llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, pos_anchor, -1);
+        if (llama_model_n_layer(llama_get_model(ctx_dft)) > 0) {
+            return llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, pos_anchor, -1);
+        }
+        return true;
     }
 
     bool pipe_lookahead_allowed() const {
@@ -2941,6 +3085,23 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 layer_rows[k] = layer + (size_t) i_batch_beg[seq_id] * n_embd_tgt;
             }
 
+            if (seq_id < (llama_seq_id) last_target_h.size() && n_rows > 0) {
+                current_batch_h[seq_id].assign(layer_rows[0], layer_rows[0] + (size_t) n_rows * n_embd_tgt);
+                const float * last_row = layer_rows[0] + (size_t) (n_rows - 1) * n_embd_tgt;
+                std::memcpy(last_target_h[seq_id].data(), last_row, (size_t) n_embd_tgt * sizeof(float));
+                if (n_rows > 8) {
+                    if (const char * dump_path = std::getenv("LLAMA_DUMP_LATENT_TRAJECTORIES")) {
+                        static FILE * f_dump_p = fopen(dump_path, "ab");
+                        if (f_dump_p) {
+                            fwrite(layer_rows[0], sizeof(float), (size_t) n_rows * n_embd_tgt, f_dump_p);
+                            fflush(f_dump_p);
+                            fprintf(stderr, "[dump-prompt-trajectories] dumped %d vectors to %s\n", n_rows, dump_path);
+                        }
+                    }
+                }
+            }
+
+
             if (!ingest_rows(seq_id, n_rows, layer_rows, batch_in.pos + i_batch_beg[seq_id])) {
                 return false;
             }
@@ -3018,6 +3179,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             for (int32_t i = 0; i < n_block_tokens; ++i) {
                 common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, !is_dflash2);
             }
+            if (batch.embd && seq_id < (llama_seq_id) last_target_h.size() && !last_target_h[seq_id].empty()) {
+                std::memcpy(batch.embd + (size_t) i_block_beg[seq_id] * n_embd_tgt,
+                            last_target_h[seq_id].data(),
+                            (size_t) n_embd_tgt * sizeof(float));
+                if (std::getenv("LLAMA_SPEC_DEBUG") != nullptr) {
+                    float h_norm = 0.0f;
+                    for (float v : last_target_h[seq_id]) h_norm += v*v;
+                    fprintf(stderr, "[draft-h-norm seq=%d] norm=%.4f v0=%.4f\n", seq_id, sqrtf(h_norm), last_target_h[seq_id][0]);
+                }
+            }
         }
 
         if (batch.n_tokens == 0) {
@@ -3040,6 +3211,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         const float enq_ms  = t_draft_enq_us / 1000.0f;
         const float sync_ms = t_draft_sync_us / 1000.0f;
         const float total_d_ms = (t_draft_end_us - t_draft_start_us) / 1000.0f;
+        if (std::getenv("LLAMA_SPEC_DEBUG") != nullptr) {
+            fprintf(stderr, "[dflash-timer batch_tokens=%d draft_cpu_enq=%.2f ms draft_gpu_sync=%.2f ms total_td=%.2f ms]\n",
+                    (int)batch.n_tokens, enq_ms, sync_ms, total_d_ms);
+        }
         LOG_INF("[dflash-timer] batch_tokens=%d draft_cpu_enq=%.2f ms draft_gpu_sync=%.2f ms total_td=%.2f ms\n",
                 (int)batch.n_tokens, enq_ms, sync_ms, total_d_ms);
         if (spec::g_dflash_prof.active && spec::g_dflash_prof.t_output_us > 0) {
@@ -3124,6 +3299,27 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+        if (std::getenv("LLAMA_SPEC_DEBUG") != nullptr) {
+            fprintf(stderr, "[spec-accept seq=%d k=%d n_accepted=%u]\n",
+                    (int) seq_id, (int) last_k_drafted[seq_id], (unsigned) n_accepted);
+        }
+        if (seq_id >= 0 && seq_id < (llama_seq_id) last_target_h.size() &&
+            seq_id < (llama_seq_id) current_batch_h.size() && n_embd_tgt > 0) {
+            size_t n_avail_rows = current_batch_h[seq_id].size() / n_embd_tgt;
+            if (n_avail_rows > 0) {
+                size_t selected_row = std::min((size_t) n_accepted, n_avail_rows - 1);
+                std::memcpy(last_target_h[seq_id].data(),
+                            current_batch_h[seq_id].data() + selected_row * n_embd_tgt,
+                            (size_t) n_embd_tgt * sizeof(float));
+                if (const char * dump_path = std::getenv("LLAMA_DUMP_LATENT_TRAJECTORIES")) {
+                    static FILE * f_dump = fopen(dump_path, "ab");
+                    if (f_dump) {
+                        fwrite(last_target_h[seq_id].data(), sizeof(float), (size_t) n_embd_tgt, f_dump);
+                        fflush(f_dump);
+                    }
+                }
+            }
+        }
         if (!is_other && seq_id >= 0 && seq_id < (llama_seq_id) arbiters.size()) {
             float d_ms = seq_id < (llama_seq_id) last_draft_ms.size() ? last_draft_ms[seq_id] : 0.0f;
             arbiters[seq_id].observe(last_k_drafted[seq_id], n_accepted, d_ms);
@@ -4107,10 +4303,13 @@ std::vector<common_speculative_type> common_speculative_types_from_gguf(const st
 
     const std::string arch = gguf_get_val_str(gguf_ctx.get(), arch_id);
     if (arch != "dflash") {
-        const uint32_t block_count = gguf_get_val_u32(gguf_ctx.get(), gguf_find_key(gguf_ctx.get(), (arch + ".block_count").c_str()));
+        const int64_t key_bc = gguf_find_key(gguf_ctx.get(), (arch + ".block_count").c_str());
+        if (key_bc >= 0) {
+            const uint32_t block_count = gguf_get_val_u32(gguf_ctx.get(), key_bc);
 
-        if (gguf_find_tensor(gguf_ctx.get(), ("blk." + std::to_string(block_count - 1) + ".nextn.eh_proj.weight").c_str()) >= 0) {
-            return { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+            if (gguf_find_tensor(gguf_ctx.get(), ("blk." + std::to_string(block_count - 1) + ".nextn.eh_proj.weight").c_str()) >= 0) {
+                return { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+            }
         }
 
         return {};
@@ -4820,3 +5019,13 @@ void common_speculative_pipeline_abort(common_speculative * spec) {
     }
     return s;
 }
+
+bool common_speculative_get_tree_plan(common_speculative * spec, llama_seq_id seq_id, prism::m4::tree_batch_plan_m4 & plan) {
+    const auto * d = common_speculative_find_dflash(spec);
+    if (d == nullptr || seq_id < 0 || seq_id >= (llama_seq_id) d->last_tree_plan.size()) {
+        return false;
+    }
+    plan = d->last_tree_plan[seq_id];
+    return true;
+}
+

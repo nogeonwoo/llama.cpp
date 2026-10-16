@@ -255,6 +255,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
             }
         }
     }
+    res->t_layer_inp[n_layer] = inpL;
     cur = inpL;
     // multi-layer hidden-state tap: concatenate captured layers along dim0 into a
     // single [n_capture * n_embd, n_outputs] tensor for one bulk host copy.
