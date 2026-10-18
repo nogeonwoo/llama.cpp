@@ -2173,8 +2173,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         aparams.drafter  = dkind;
         aparams.id_open  = id_think_start;
         aparams.id_close = id_think_end;
-        aparams.allow_k2 = false; // K=2 is dominated on M3
-        aparams.force_k0_in_think = false; // let the mathematical model decide
+        const char * env_k0_think = std::getenv("LLAMA_SPEC_FORCE_K0_IN_THINK");
+        aparams.force_k0_in_think = env_k0_think ? (std::atoi(env_k0_think) != 0) : true; // protect against draft deficit in <think>
 
         const char * env_pipe = std::getenv("LLAMA_SPEC_PIPELINE");
         if (env_pipe && (std::strcmp(env_pipe, "1") == 0 || std::strcmp(env_pipe, "true") == 0)) {

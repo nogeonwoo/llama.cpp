@@ -2794,8 +2794,27 @@ static bool ggml_metal_op_lowrank_fusable(ggml_metal_op_t ctx, int idx) {
 static int ggml_metal_op_lowrank_ntg(int64_t d_out) {
     static const int cfg = []() {
         const char * s = getenv("GGML_METAL_LOWRANK_NTG");
-        const int    v = s ? atoi(s) : 10;
-        return v > 0 ? v : 10;
+        if (s) {
+            const int v = atoi(s);
+            if (v > 0) return v;
+        }
+        int cores = 10;
+#if defined(__APPLE__)
+        FILE * fp = popen("ioreg -r -c IOAccelerator 2>/dev/null", "r");
+        if (fp) {
+            char buf[256];
+            while (fgets(buf, sizeof(buf), fp)) {
+                char * p = strstr(buf, "\"gpu-core-count\" = ");
+                if (p) {
+                    int c = atoi(p + 19);
+                    if (c > 0) cores = c;
+                    break;
+                }
+            }
+            pclose(fp);
+        }
+#endif
+        return cores;
     }();
     const int64_t row_groups = (d_out + 15) / 16;
     return (int) std::max<int64_t>(1, std::min<int64_t>(cfg, row_groups));

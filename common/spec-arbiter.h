@@ -123,6 +123,7 @@ public:
 
     // Feeds tokens to detect <think> and </think> delimiters
     void feed_token_id(int token_id) {
+        const bool was_in_think = think_phase_;
         if (P_.id_open >= 0 && token_id == P_.id_open) {
             think_phase_ = true;
         } else if (P_.id_close >= 0 && token_id == P_.id_close) {
@@ -131,6 +132,19 @@ public:
             think_phase_ = true;
         } else if (token_id == 248069) {
             think_phase_ = false;
+        }
+
+        if (!was_in_think && think_phase_ && P_.force_k0_in_think) {
+            set_k_(0);
+        } else if (was_in_think && !think_phase_) {
+            // Immediately awaken drafter from K=0 park state when exiting <think>
+            if (k_cur_ == 0) {
+                set_k_(P_.baseline_k > 0 ? P_.baseline_k : 1);
+                n_warm_       = 0;
+                park_cycles_  = 0;
+                iv_           = P_.probe_iv_min;
+                bail_counter_ = 0;
+            }
         }
     }
 
