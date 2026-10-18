@@ -3300,8 +3300,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
         if (std::getenv("LLAMA_SPEC_DEBUG") != nullptr) {
-            fprintf(stderr, "[spec-accept seq=%d k=%d n_accepted=%u]\n",
-                    (int) seq_id, (int) last_k_drafted[seq_id], (unsigned) n_accepted);
+            fprintf(stderr, "[spec-accept seq=%d k=%d n_accepted=%u is_other=%d]\n",
+                    (int) seq_id, (int) last_k_drafted[seq_id], (unsigned) n_accepted, (int) is_other);
         }
         if (seq_id >= 0 && seq_id < (llama_seq_id) last_target_h.size() &&
             seq_id < (llama_seq_id) current_batch_h.size() && n_embd_tgt > 0) {
