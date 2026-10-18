@@ -4854,10 +4854,20 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
     }
 
     // accept with the rest of the implementations, using is_other == true
+    bool has_dflash = false;
     for (auto & impl_other : spec->impls) {
+        if (impl_other->type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+            impl_other->type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) {
+            has_dflash = true;
+        }
         if (impl_other.get() != impl) {
             impl_other->accept(seq_id, n_accepted, true);
         }
+    }
+
+    if (!has_dflash && std::getenv("LLAMA_SPEC_DEBUG") != nullptr) {
+        fprintf(stderr, "[spec-accept seq=%d k=0 n_accepted=%u is_other=1]\n",
+                (int) seq_id, (unsigned) n_accepted);
     }
 }
 
