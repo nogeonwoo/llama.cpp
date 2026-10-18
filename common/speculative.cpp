@@ -2032,6 +2032,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     std::vector<int64_t>       cycle_count;
     std::vector<int64_t>       accept_count;
     std::vector<float>         last_draft_ms;
+    std::vector<size_t>        last_fed_prompt_len;
     std::vector<prism::m4::tree_batch_plan_m4> last_tree_plan;
 
     // -----------------------------------------------------------------------------------------------------------
@@ -2174,7 +2175,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         aparams.id_open  = id_think_start;
         aparams.id_close = id_think_end;
         const char * env_k0_think = std::getenv("LLAMA_SPEC_FORCE_K0_IN_THINK");
-        aparams.force_k0_in_think = env_k0_think ? (std::atoi(env_k0_think) != 0) : true; // protect against draft deficit in <think>
+        aparams.force_k0_in_think = env_k0_think ? (std::atoi(env_k0_think) != 0) : false;
 
         const char * env_pipe = std::getenv("LLAMA_SPEC_PIPELINE");
         if (env_pipe && (std::strcmp(env_pipe, "1") == 0 || std::strcmp(env_pipe, "true") == 0)) {
@@ -2195,6 +2196,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         cycle_count.assign(n_seq, 0);
         accept_count.assign(n_seq, 0);
         last_draft_ms.assign(n_seq, 0.0f);
+        last_fed_prompt_len.assign(n_seq, 0);
         last_tree_plan.resize(n_seq);
 
         LOG_INF("%s: speculative arbiter initialized (mode=%s, drafter=%s, think_start=%d, think_end=%d, log_interval=%d, n_seq=%u)\n",
@@ -2998,6 +3000,27 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 
 
+    void sync_arbiter_tokens(llama_seq_id seq_id, const llama_tokens * prompt, llama_token id_last) {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) arbiters.size()) {
+            return;
+        }
+        auto & arb = arbiters[seq_id];
+        if (prompt != nullptr && seq_id < (llama_seq_id) last_fed_prompt_len.size()) {
+            const size_t n_prompt = prompt->size();
+            size_t start_idx = last_fed_prompt_len[seq_id];
+            if (start_idx > n_prompt) {
+                start_idx = 0;
+            }
+            for (size_t i = start_idx; i < n_prompt; ++i) {
+                arb.feed_token_id((*prompt)[i]);
+            }
+            last_fed_prompt_len[seq_id] = n_prompt;
+        }
+        if (id_last >= 0) {
+            arb.feed_token_id(id_last);
+        }
+    }
+
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
@@ -3009,9 +3032,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         if (seq_id < (llama_seq_id) arbiters.size()) {
             arbiters[seq_id].reset(false);
-            for (auto t : prompt) {
-                arbiters[seq_id].feed_token_id(t);
-            }
+            last_fed_prompt_len[seq_id] = 0;
+            sync_arbiter_tokens(seq_id, &prompt, -1);
             last_k_drafted[seq_id] = 1;
             cycle_count[seq_id] = 0;
             last_draft_ms[seq_id] = 0.0f;
@@ -3126,6 +3148,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
+            sync_arbiter_tokens(seq_id, dp.prompt, dp.id_last);
             if (!dp.drafting) {
                 continue;
             }
@@ -3134,8 +3157,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             int k_pred = 1;
             int k_actual = 1;
             if (seq_id < (llama_seq_id) arbiters.size()) {
-                arbiters[seq_id].feed_token_id(dp.id_last);
-
                 k_pred = arbiters[seq_id].pred_k();
                 k_actual = arbiters[seq_id].select_k();
 
@@ -4731,6 +4752,14 @@ void common_speculative_draft(common_speculative * spec) {
 
         if (n_drafting == 0) {
             return;
+        }
+    }
+
+    for (auto & impl : spec->impls) {
+        if (auto * d = dynamic_cast<common_speculative_impl_draft_dflash *>(impl.get())) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
+                d->sync_arbiter_tokens(seq_id, dparams[seq_id].prompt, dparams[seq_id].id_last);
+            }
         }
     }
 

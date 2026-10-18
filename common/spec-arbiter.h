@@ -138,13 +138,20 @@ public:
             set_k_(0);
         } else if (was_in_think && !think_phase_) {
             // Immediately awaken drafter from K=0 park state when exiting <think>
-            if (k_cur_ == 0) {
+            // and clear degraded <think> EMA priors so <think> misses do not penalize content phase
+            if (k_cur_ == 0 || a_[1] < 0.60) {
+                for (int j = 0; j <= arbiter_k_max; ++j) {
+                    a_[j] = 1.0;
+                    c_[j] = 1.0;
+                    n_obs_[j] = 0;
+                }
                 set_k_(P_.baseline_k > 0 ? P_.baseline_k : 1);
-                n_warm_       = 0;
-                park_cycles_  = 0;
-                iv_           = P_.probe_iv_min;
-                bail_counter_ = 0;
+                n_warm_ = 0;
             }
+            park_cycles_  = 0;
+            iv_           = P_.probe_iv_min;
+            bail_counter_ = 0;
+            probing_      = false;
         }
     }
 
@@ -296,9 +303,14 @@ public:
 
         // Standard online conditional update (Point 5 resolved)
         // Position j was evaluated by target model iff position j-1 was accepted
+        // In <think> phase, use faster adaptation (alpha >= 0.35) during warmup/degradation
+        // so low-acceptance reasoning monologues bail out to K=0 within ~3 cycles.
+        const double eff_alpha = (think_phase_ && n_obs_[1] < (uint32_t) std::max(P_.warmup, 4))
+                                 ? std::max(P_.alpha, 0.35)
+                                 : P_.alpha;
         for (int j = 1; j <= k; ++j) {
             if (s[j - 1] > 0.5) {
-                c_[j] += P_.alpha * (s[j] - c_[j]);
+                c_[j] += eff_alpha * (s[j] - c_[j]);
                 n_obs_[j]++;
             }
         }
@@ -424,10 +436,12 @@ private:
 
         // 1. Fast Bailout Check to K=0:
         // If AR baseline beats current policy, check consecutive counter
+        // (In <think> phase, bail out on the first confirmation after warmup)
+        const int eff_consec_bail = think_phase_ ? 1 : P_.consec_bail;
         if (k_cur_ > 0 && tps[0] > cur_tps) {
             bail_counter_++;
             // Immediate bailout if severe collapse (a1 < 0.10) or consecutive confirmations
-            if (a_[1] < 0.10 || bail_counter_ >= P_.consec_bail) {
+            if (a_[1] < 0.10 || bail_counter_ >= eff_consec_bail) {
                 set_k_(0);
                 bail_counter_ = 0;
                 return;
